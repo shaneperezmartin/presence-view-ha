@@ -922,5 +922,239 @@ class UpdaterTests(unittest.TestCase):
         self.assertFalse((self.root/u.STORE).exists())
         self.assertEqual((self.app/"server.py").read_bytes(),b"modified source")
 
+    def source_modes_666(self):
+        for name in self.baseline:(self.app/name).chmod(0o666)
+        return {name:u.extra_metadata((self.app/name).lstat()) for name in self.baseline}
+
+    @property
+    def permission_transaction(self):
+        return self.root/u.STORE/self.updater.permission_id
+
+    def tighten(self, hook=lambda e,n:None):
+        preflight=self.updater.inspect_permissions()
+        return self.updater.normalize_permissions(preflight["permission_fingerprint"],hook)
+
+    def test_permission_preflight_is_scoped_and_read_only(self):
+        original=self.source_modes_666()
+        with mock.patch.object(u.os,"write",side_effect=AssertionError("write")), \
+             mock.patch.object(u.os,"fchmod",side_effect=AssertionError("chmod")), \
+             mock.patch.object(u.os,"mkdir",side_effect=AssertionError("mkdir")):
+            result=self.updater.inspect_permissions()
+        self.assertEqual(result["mode_0666"],len(self.baseline))
+        self.assertEqual(result["mode_0644"],0)
+        self.assertTrue(result["baseline_bytes_verified"])
+        self.assertFalse(result["source_verified"])
+        self.assertNotIn("source_fingerprint",result)
+        self.assertTrue(result["permission_fingerprint"].startswith("perm:"))
+        self.assertNotIn("do-not-log",json.dumps(result))
+        self.assertFalse((self.root/u.STORE).exists())
+        self.assertEqual(original,{n:u.extra_metadata((self.app/n).lstat()) for n in self.baseline})
+        with self.assertRaises(u.Refused):self.updater.run("apply",result["permission_fingerprint"])
+        with self.assertRaises(u.Refused):self.updater.normalize_permissions("0"*64)
+
+    def test_permission_normalization_preserves_content_inode_extras_and_audit(self):
+        extras=self.make_extras();original=self.source_modes_666()
+        source_inodes={m["inode"] for m in original.values()};calls=[]
+        real_chmod=u.os.fchmod;real_open=u.os.open
+        def observed(fd,mode):
+            st=os.fstat(fd)
+            if st.st_ino in source_inodes:
+                self.assertEqual(mode,0o644);calls.append(st.st_ino)
+            return real_chmod(fd,mode)
+        def no_extra_open(name,flags,*args,**kwargs):
+            self.assertNotIn(name,extras)
+            if name in self.baseline:self.assertFalse(flags & (os.O_WRONLY|os.O_RDWR))
+            return real_open(name,flags,*args,**kwargs)
+        def ready_before_change(e,n):
+            if e=="before_chmod":
+                self.assertTrue((self.permission_transaction/"ready.json").exists())
+                self.assertTrue((self.permission_transaction/self.updater.permission_intent_name(n)).exists())
+                for f in self.baseline:
+                    blob=self.permission_transaction/"original"/self.updater.backup_name(f)
+                    self.assertEqual(blob.read_bytes(),self.baseline[f])
+                    self.assertEqual(stat.S_IMODE(blob.stat().st_mode),0o600)
+        with mock.patch.object(u.os,"fchmod",observed),mock.patch.object(u.os,"open",no_extra_open):
+            result=self.tighten(ready_before_change)
+        self.assertEqual(result["status"],"permissions_normalized")
+        self.assertEqual(set(calls),source_inodes)
+        self.assertEqual(len(calls),len(source_inodes))
+        for name,old in original.items():
+            now=u.extra_metadata((self.app/name).lstat())
+            self.assertEqual(now["mode"],stat.S_IFREG|0o644)
+            self.assertEqual({k:v for k,v in now.items() if k not in ("mode","ctime_ns")},
+                             {k:v for k,v in old.items() if k not in ("mode","ctime_ns")})
+            self.assertEqual((self.app/name).read_bytes(),self.baseline[name])
+        self.assert_extras_unchanged(extras)
+        record=json.loads((self.permission_transaction/"original.json").read_bytes())
+        self.assertEqual({n:v["metadata"] for n,v in record["files"].items()},original)
+        for p in self.permission_transaction.rglob("*"):
+            if p.is_file():self.assertNotIn(b"UNREAD EXTRA CONTENT",p.read_bytes())
+        self.assertEqual(self.updater.inspect()["status"],"baseline")
+
+    def test_permission_skips_already_644_and_is_idempotent(self):
+        self.source_modes_666();name=next(iter(self.baseline));(self.app/name).chmod(0o644)
+        old=u.extra_metadata((self.app/name).lstat())
+        self.tighten()
+        self.assertEqual(u.extra_metadata((self.app/name).lstat()),old)
+        with mock.patch.object(u.os,"fchmod",side_effect=AssertionError("no repeated chmod")):
+            self.assertEqual(self.tighten()["status"],"permissions_already_0644")
+
+    def test_permission_noop_on_original_644_creates_no_backup(self):
+        self.assertEqual(self.tighten()["status"],"permissions_already_0644")
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_permission_rejects_unknown_modes_hashes_or_new_source(self):
+        self.source_modes_666()
+        for mode in (0o600,0o664,0o755,0o777,0o4666):
+            (self.app/"server.py").chmod(mode)
+            with self.subTest(mode=mode):
+                with self.assertRaises(u.Refused):self.updater.inspect_permissions()
+        (self.app/"server.py").chmod(0o666);(self.app/"server.py").write_bytes(b"changed")
+        with self.assertRaises(u.Refused):self.updater.inspect_permissions()
+        (self.app/"server.py").write_bytes(self.baseline["server.py"])
+        (self.app/"export.py").write_bytes(self.payload["export.py"])
+        with self.assertRaises(u.Refused):self.updater.inspect_permissions()
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_permission_token_binds_replaced_equal_content_inode(self):
+        self.source_modes_666();token=self.updater.inspect_permissions()["permission_fingerprint"]
+        p=self.app/"server.py";p.rename(self.outside/"old-source")
+        p.write_bytes(self.baseline["server.py"]);p.chmod(0o666)
+        with self.assertRaisesRegex(u.Refused,"fingerprint changed"):self.updater.normalize_permissions(token)
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_permission_original_inspect_and_apply_still_refuse_666(self):
+        token=self.updater.inspect()["source_fingerprint"];self.source_modes_666()
+        with self.assertRaises(u.SourceMismatch):self.updater.inspect()
+        with self.assertRaises(u.Refused):self.updater.run("apply",token)
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_permission_failure_never_rolls_back_to_world_write(self):
+        self.source_modes_666();first=sorted(self.baseline)[0]
+        def fail(e,n):
+            if e=="after_chmod":raise RuntimeError("synthetic interruption")
+        with self.assertRaisesRegex(u.Refused,"no permissions were loosened"):self.tighten(fail)
+        self.assertEqual(stat.S_IMODE((self.app/first).stat().st_mode),0o644)
+        self.updater=u.Updater(self.root,self.bundle)
+        self.assertEqual(self.updater.inspect_permissions()["mode_0644"],1)
+        self.assertEqual(self.tighten()["status"],"permissions_normalized")
+        self.assertEqual(self.updater.inspect()["status"],"baseline")
+
+    def test_permission_crash_after_each_chmod_can_resume(self):
+        for boundary in ("before_chmod","after_chmod"):
+            for stop in sorted(self.baseline):
+                with self.subTest(boundary=boundary,stop=stop):
+                    if (self.root/u.STORE).exists():shutil.rmtree(self.root/u.STORE)
+                    self.source_modes_666();self.updater=u.Updater(self.root,self.bundle)
+                    def crash(e,n):
+                        if e==boundary and n==stop:raise Crash()
+                    with self.assertRaises(Crash):self.tighten(crash)
+                    self.updater=u.Updater(self.root,self.bundle)
+                    self.tighten()
+                    self.assertEqual(self.updater.inspect()["status"],"baseline")
+
+    def test_permission_crash_immediately_after_syscall_can_resume(self):
+        original=self.source_modes_666();inodes={v["inode"] for v in original.values()};real=u.os.fchmod
+        def crash(fd,mode):
+            real(fd,mode)
+            if os.fstat(fd).st_ino in inodes:raise Crash()
+        with mock.patch.object(u.os,"fchmod",crash):
+            with self.assertRaises(Crash):self.tighten()
+        self.updater=u.Updater(self.root,self.bundle)
+        self.assertEqual(self.updater.inspect_permissions()["mode_0644"],1)
+        self.tighten()
+        self.assertEqual(self.updater.inspect()["status"],"baseline")
+
+    def test_permission_unjournaled_mode_change_is_not_rebaselined(self):
+        self.source_modes_666();first=sorted(self.baseline)[0];last=sorted(self.baseline)[-1]
+        def crash(e,n):
+            if e=="before_chmod":raise Crash()
+        with self.assertRaises(Crash):self.tighten(crash)
+        (self.app/last).chmod(0o644)
+        self.updater=u.Updater(self.root,self.bundle)
+        with self.assertRaisesRegex(u.Refused,"Unexpected source change"):self.updater.inspect_permissions()
+        self.assertEqual(stat.S_IMODE((self.app/first).stat().st_mode),0o666)
+
+    def test_permission_fresh_recovery_refuses_changed_extras(self):
+        self.make_extras();self.source_modes_666()
+        def crash(e,n):
+            if e=="after_chmod":raise Crash()
+        with self.assertRaises(Crash):self.tighten(crash)
+        (self.app/"legacy-stage.bin").write_bytes(b"changed extra")
+        self.updater=u.Updater(self.root,self.bundle,preserve_extra_files=["legacy-stage.bin"])
+        with self.assertRaises(u.Refused):self.updater.inspect_permissions()
+        self.assertEqual((self.app/"legacy-stage.bin").read_bytes(),b"changed extra")
+
+    def test_permission_final_syscall_name_swap_never_chmods_replacement(self):
+        original=self.source_modes_666();first=sorted(self.baseline)[0];target_inode=original[first]["inode"];real=u.os.fchmod
+        def swap(fd,mode):
+            if os.fstat(fd).st_ino==target_inode:
+                (self.app/first).rename(self.outside/"moved-original")
+                (self.app/first).write_bytes(b"UNRELATED REPLACEMENT")
+                (self.app/first).chmod(0o666)
+            return real(fd,mode)
+        with mock.patch.object(u.os,"fchmod",swap):
+            with self.assertRaises(u.Refused):self.tighten()
+        self.assertEqual((self.app/first).read_bytes(),b"UNRELATED REPLACEMENT")
+        self.assertEqual(stat.S_IMODE((self.app/first).stat().st_mode),0o666)
+        self.assertEqual((self.outside/"moved-original").read_bytes(),self.baseline[first])
+        self.assertEqual(stat.S_IMODE((self.outside/"moved-original").stat().st_mode),0o644)
+
+    def test_permission_final_syscall_content_race_is_preserved_and_refused(self):
+        original=self.source_modes_666();first=sorted(self.baseline)[0];target_inode=original[first]["inode"];real=u.os.fchmod
+        def race(fd,mode):
+            if os.fstat(fd).st_ino==target_inode:(self.app/first).write_bytes(b"UNKNOWN CONCURRENT BYTES")
+            return real(fd,mode)
+        with mock.patch.object(u.os,"fchmod",race):
+            with self.assertRaises(u.Refused):self.tighten()
+        self.assertEqual((self.app/first).read_bytes(),b"UNKNOWN CONCURRENT BYTES")
+        self.assertEqual(stat.S_IMODE((self.app/first).stat().st_mode),0o644)
+        self.assertEqual((self.permission_transaction/"original"/self.updater.backup_name(first)).read_bytes(),self.baseline[first])
+
+    def test_permission_backup_corruption_refuses_before_further_chmod(self):
+        self.source_modes_666()
+        def crash(e,n):
+            if e=="before_chmod":raise Crash()
+        with self.assertRaises(Crash):self.tighten(crash)
+        blob=self.permission_transaction/"original"/self.updater.backup_name("server.py")
+        blob.write_bytes(b"bad")
+        with mock.patch.object(u.os,"fchmod",side_effect=AssertionError("chmod forbidden")):
+            with self.assertRaises(u.Refused):self.updater.inspect_permissions()
+        self.assertTrue(all(stat.S_IMODE((self.app/n).stat().st_mode)==0o666 for n in self.baseline))
+
+    def test_permission_incomplete_original_metadata_refuses_safely(self):
+        self.source_modes_666();real=u.os.write
+        def partial(fd,data):real(fd,data[:max(1,len(data)//2)]);raise Crash()
+        with mock.patch.object(u.os,"write",partial):
+            with self.assertRaises(Crash):self.tighten()
+        with self.assertRaisesRegex(u.Refused,"Incomplete permission metadata"):self.updater.inspect_permissions()
+        self.assertTrue(all(stat.S_IMODE((self.app/n).stat().st_mode)==0o666 for n in self.baseline))
+
+    def test_permission_partial_backup_blob_resumes_with_same_metadata(self):
+        self.source_modes_666();real=self.updater.write_new
+        def crash(fd,name,data,mode=0o600):
+            real(fd,name,data,mode)
+            if name.endswith(".blob"):raise Crash()
+        self.updater.write_new=crash
+        with self.assertRaises(Crash):self.tighten()
+        self.updater=u.Updater(self.root,self.bundle)
+        self.tighten()
+        self.assertEqual(self.updater.inspect()["status"],"baseline")
+
+    def test_permission_then_ordinary_apply_rollback_never_restores_666(self):
+        self.source_modes_666();self.tighten()
+        record=(self.permission_transaction/"original.json").read_bytes()
+        self.start();self.start("rollback")
+        self.assert_source(self.baseline)
+        self.assertTrue(all(stat.S_IMODE((self.app/n).stat().st_mode)==0o644 for n in self.baseline))
+        self.assertEqual((self.permission_transaction/"original.json").read_bytes(),record)
+
+    def test_permission_symlink_target_is_refused_without_following(self):
+        self.source_modes_666();p=self.app/"server.py";p.unlink();p.symlink_to(self.other/"private-file")
+        before=stat.S_IMODE((self.other/"private-file").stat().st_mode)
+        with self.assertRaises((u.Refused,OSError)):self.updater.inspect_permissions()
+        self.assertEqual(stat.S_IMODE((self.other/"private-file").stat().st_mode),before)
+        self.assertFalse((self.root/u.STORE).exists())
+
 
 if __name__=="__main__":unittest.main()

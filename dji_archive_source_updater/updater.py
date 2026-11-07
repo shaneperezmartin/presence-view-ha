@@ -463,6 +463,222 @@ class Updater:
         require(phase != "mixed" or recovery, "Mixed source without verified recovery backup")
         return recovery
 
+    @property
+    def permission_id(self):
+        return "permissions-" + digest(canonical(self.manifest["baseline"]))
+
+    def validate_permission_state(self, current):
+        require(all(info["mode"] == 0o644 for info in self.base.values()), "Permission normalization requires a 0644 baseline")
+        for name in self.names:
+            item = current[name]
+            if name not in self.base:
+                require(item is None, "Permission normalization requires original source only")
+                continue
+            require(item is not None and digest(item[0]) == self.base[name]["sha256"],
+                    "Permission normalization requires exact baseline hashes")
+            require(stat.S_IMODE(item[1].st_mode) in (0o644, 0o666),
+                    "Permission normalization accepts only modes 0644 or 0666")
+
+    def permission_record(self, current):
+        return {"policy": self.permission_id, "app_identity": list(self.app_identity),
+                "files": {n: {"sha256": self.base[n]["sha256"], "metadata": extra_metadata(current[n][1])}
+                          for n in sorted(self.base)}, "extras": current["_preserved_extras"]}
+
+    def permission_intent_name(self, name):
+        return "intent-" + digest(name.encode()) + ".json"
+
+    def permission_intent(self, name, record):
+        return canonical({"policy": self.permission_id, "file": name, "target_mode": 0o644,
+                          "before": record["files"][name]})
+
+    def check_permission_backup(self, transaction, current):
+        """Validate immutable audit data and only journaled 0666 -> 0644 transitions."""
+        names = {"original.json", "ready.json"} | {self.permission_intent_name(n) for n in self.base}
+        entries = set(os.listdir(transaction))
+        require(entries <= names | {n + ".pending" for n in names} | {"original"}, "Unexpected permission recovery entries")
+        saved = read_at(transaction, "original.json")
+        ready = read_at(transaction, "ready.json")
+        if saved is None:
+            require(entries <= {"original.json.pending"}, "Permission recovery metadata missing")
+            pending = read_at(transaction, "original.json.pending")
+            require(pending is None or pending[0] == canonical(self.permission_record(current)),
+                    "Incomplete permission metadata requires review")
+            return None, False
+        try:
+            record = json.loads(saved[0])
+        except (ValueError, UnicodeError):
+            raise Refused("Invalid permission recovery metadata") from None
+        require(isinstance(record, dict) and set(record) == {"policy", "app_identity", "files", "extras"} and
+                isinstance(record["files"], dict) and isinstance(record["extras"], dict) and
+                record["policy"] == self.permission_id and record["app_identity"] == list(self.app_identity) and
+                record["extras"] == current["_preserved_extras"] and set(record["files"]) == set(self.base),
+                "Permission recovery identities or extras changed")
+        if ready is not None:
+            require(ready[0] == canonical({"policy": self.permission_id, "original_sha256": digest(saved[0])}),
+                    "Permission backup readiness marker mismatch")
+        for name in self.base:
+            old = record["files"][name]
+            now = extra_metadata(current[name][1])
+            require(isinstance(old, dict) and set(old) == {"sha256", "metadata"} and
+                    old["sha256"] == self.base[name]["sha256"] and isinstance(old["metadata"], dict) and
+                    set(old["metadata"]) == set(now) and all(type(v) is int for v in old["metadata"].values()), "Invalid original permission metadata")
+            before = old["metadata"]
+            require(before["mode"] in (stat.S_IFREG | 0o644, stat.S_IFREG | 0o666), "Invalid original permission mode")
+            intent = read_at(transaction, self.permission_intent_name(name))
+            if intent is not None:
+                require(ready is not None and before["mode"] == stat.S_IFREG | 0o666 and
+                        intent[0] == self.permission_intent(name, record), "Invalid permission intent")
+            if now != before:
+                require(ready is not None and intent is not None and before["mode"] == stat.S_IFREG | 0o666 and
+                        now["mode"] == stat.S_IFREG | 0o644 and
+                        {k: v for k, v in now.items() if k not in ("mode", "ctime_ns")} ==
+                        {k: v for k, v in before.items() if k not in ("mode", "ctime_ns")},
+                        "Unexpected source change during permission recovery")
+        if "original" in entries:
+            with self.directory("original", transaction) as originals:
+                self.check_private_directory(originals)
+                expected = {self.backup_name(n) for n in self.base}
+                require(set(os.listdir(originals)) <= expected | {n + ".pending" for n in expected},
+                        "Unexpected permission backup objects")
+                for name, info in self.base.items():
+                    item = read_at(originals, self.backup_name(name))
+                    require(item is not None or ready is None, "Permission source backup missing")
+                    if item is not None:
+                        require(digest(item[0]) == info["sha256"] and stat.S_IMODE(item[1].st_mode) == 0o600 and
+                                item[1].st_uid == os.geteuid(),
+                                "Permission source backup hash or mode mismatch")
+        else:
+            require(ready is None, "Permission source backups missing")
+        return record, ready is not None
+
+    def existing_permission_backup(self, root, current):
+        if STORE not in os.listdir(root):
+            return None, False
+        with self.directory(STORE, root) as store:
+            self.check_private_directory(store)
+            if self.permission_id not in os.listdir(store):
+                return None, False
+            with self.directory(self.permission_id, store) as transaction:
+                self.check_private_directory(transaction)
+                return self.check_permission_backup(transaction, current)
+
+    def permission_fingerprint(self, root, current, record):
+        return "perm:" + digest(canonical({"purpose": "tighten_exact_baseline_to_0644", "policy": self.permission_id,
+                                           "root_identity": inode(os.fstat(root)), "current": self.permission_record(current),
+                                           "recovery_record": digest(canonical(record)) if record is not None else None}))
+
+    def permission_report(self, status, fingerprint, current, backup):
+        loose = sum(stat.S_IMODE(current[n][1].st_mode) == 0o666 for n in self.base)
+        return {"status": status, "source_verified": False, "baseline_bytes_verified": True,
+                "permission_fingerprint": fingerprint, "source_files": len(self.base),
+                "mode_0666": loose, "mode_0644": len(self.base) - loose, "backup_available": backup,
+                "preserved_extra_files": len(self.extra_names), "baseline_version": self.manifest["baseline"]["version"]}
+
+    def inspect_permissions(self):
+        with self.directory(self.rootpath) as root:
+            child, _, ident = self.discover(root)
+            with self.directory(child, root) as app:
+                require(inode(os.fstat(app)) == ident, "Target directory replaced")
+                current = self.capture(app)
+                self.validate_permission_state(current)
+                self.guard(root, child, app, current)
+                record, ready = self.existing_permission_backup(root, current)
+                return self.permission_report("permission_preflight", self.permission_fingerprint(root, current, record), current, ready)
+
+    def prepare_permission_backup(self, transaction, current):
+        record, ready = self.check_permission_backup(transaction, current)
+        if ready:
+            return record
+        if record is None:
+            record = self.permission_record(current)
+            self.write_new(transaction, "original.json", canonical(record))
+        originals = self.mkdir_at(transaction, "original")
+        try:
+            for name in self.base:
+                if read_at(originals, self.backup_name(name)) is None:
+                    self.write_new(originals, self.backup_name(name), current[name][0], 0o600)
+        finally:
+            os.close(originals)
+        self.check_permission_backup(transaction, current)
+        self.write_new(transaction, "ready.json", canonical({"policy": self.permission_id,
+                                                            "original_sha256": digest(canonical(record))}))
+        self.check_permission_backup(transaction, current)
+        return record
+
+    def verify_permission_storage(self, root, store, transaction, current, record):
+        require(inode(os.stat(STORE, dir_fd=root, follow_symlinks=False)) == inode(os.fstat(store)), "Recovery storage replaced")
+        require(inode(os.stat(self.permission_id, dir_fd=store, follow_symlinks=False)) == inode(os.fstat(transaction)),
+                "Permission recovery directory replaced")
+        observed, ready = self.check_permission_backup(transaction, current)
+        require(ready and observed == record, "Permission recovery metadata changed")
+
+    def normalize_permissions(self, fingerprint, hook=lambda event, name: None):
+        require(isinstance(fingerprint, str) and re.fullmatch(r"perm:[0-9a-f]{64}", fingerprint),
+                "Explicit permission preflight fingerprint required")
+        with self.directory(self.rootpath) as root:
+            child, _, ident = self.discover(root)
+            with self.directory(child, root) as app:
+                require(inode(os.fstat(app)) == ident, "Target directory replaced")
+                try:
+                    fcntl.flock(app, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise Refused("Another updater is active") from None
+                current = self.capture(app)
+                self.validate_permission_state(current)
+                self.guard(root, child, app, current)
+                record, ready = self.existing_permission_backup(root, current)
+                require(fingerprint == self.permission_fingerprint(root, current, record), "Permission preflight fingerprint changed")
+                if all(stat.S_IMODE(current[n][1].st_mode) == 0o644 for n in self.base):
+                    return self.permission_report("permissions_already_0644", fingerprint, current, ready)
+                store = self.mkdir_at(root, STORE)
+                try:
+                    require(os.fstat(root).st_dev == os.fstat(app).st_dev == os.fstat(store).st_dev,
+                            "Source and recovery storage must share filesystem")
+                    transaction = self.mkdir_at(store, self.permission_id)
+                    try:
+                        record = self.prepare_permission_backup(transaction, current)
+                        for name in sorted(self.base):
+                            if stat.S_IMODE(current[name][1].st_mode) == 0o644:
+                                continue
+                            self.guard(root, child, app, current)
+                            self.verify_permission_storage(root, store, transaction, current, record)
+                            intent = self.permission_intent_name(name)
+                            if read_at(transaction, intent) is None:
+                                self.write_new(transaction, intent, self.permission_intent(name, record))
+                            fd = os.open(name, FLAGS, dir_fd=app)
+                            try:
+                                hook("before_chmod", name)
+                                self.guard(root, child, app, current)
+                                self.verify_permission_storage(root, store, transaction, current, record)
+                                before = current[name][1]
+                                require(extra_metadata(os.fstat(fd)) == extra_metadata(before), "Permission target descriptor changed")
+                                require(extra_metadata(os.stat(name, dir_fd=app, follow_symlinks=False)) == extra_metadata(before),
+                                        "Permission target path changed")
+                                # The sole source mutation in this mode. Never
+                                # loosen, replace content, chmod paths or extras.
+                                os.fchmod(fd, 0o644)
+                                os.fsync(fd)
+                                after = read_at(app, name)
+                                require(after is not None and digest(after[0]) == self.base[name]["sha256"] and
+                                        stat.S_IMODE(after[1].st_mode) == 0o644 and
+                                        inode(after[1]) == inode(os.fstat(fd)) == inode(before) and
+                                        {k: v for k, v in extra_metadata(after[1]).items() if k not in ("mode", "ctime_ns")} ==
+                                        {k: v for k, v in extra_metadata(before).items() if k not in ("mode", "ctime_ns")},
+                                        "Source changed during permission tightening")
+                                current[name] = after
+                                hook("after_chmod", name)
+                                self.guard(root, child, app, current)
+                            finally:
+                                os.close(fd)
+                        self.verify_permission_storage(root, store, transaction, current, record)
+                        return self.permission_report("permissions_normalized", self.permission_fingerprint(root, current, record), current, True)
+                    except Exception as error:
+                        raise Refused("Permission tightening stopped; no permissions were loosened; inspect permissions again") from error
+                    finally:
+                        os.close(transaction)
+                finally:
+                    os.close(store)
+
     def mismatch_report(self, current):
         rows = []
         for name in self.names:
@@ -840,7 +1056,11 @@ def main():
         mode = options.get("mode", "inspect")
         updater = Updater(args.root, args.bundle, options.get("transcript_export_token_sha256", ""),
                           options.get("preserve_extra_files", []))
-        if mode == "diagnose":
+        if mode == "inspect_permissions":
+            result = updater.inspect_permissions()
+        elif mode == "normalize_permissions":
+            result = updater.normalize_permissions(options.get("expected_fingerprint", ""))
+        elif mode == "diagnose":
             result = updater.diagnose(options.get("diagnostic_offset", 0), options.get("diagnostic_snapshot", ""))
         elif mode == "inspect":
             result = updater.inspect()

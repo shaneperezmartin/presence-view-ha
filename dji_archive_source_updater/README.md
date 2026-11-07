@@ -23,6 +23,78 @@ app data. The fixed payload upgrades the original reviewed DJI Audio Archive
   quiescent during apply/recovery. The running recorder may continue recording:
   this changes its source tree, not its running image or `/data`.
 
+## Separately approved permission tightening
+
+Version 1.0.4 adds one narrowly scoped permission operation. **Permission to
+update source is not permission to change its security-sensitive file modes.**
+Use `normalize_permissions` only after explicit action-time approval for the
+exact reviewed baseline files currently at 0666 to be tightened to 0644. This
+package grants no standing or automatic authorization. Default startup/mode and
+platform permissions are unchanged; no live filenames are approved by this text.
+
+`inspect_permissions` is read-only. It accepts only original baseline source
+bytes, no added payload files, and baseline modes 0644/0666. Unknown hashes,
+other modes, unsafe files, missing files or unapproved extras refuse. It reports
+counts and a `perm:`-prefixed fingerprint binding the root/app identities, each
+source file's device/inode/hash/full mode/link count/size/owner/mtime/ctime,
+private extra metadata and any original recovery record. The token is not an
+ordinary source-update fingerprint and cannot be used for `apply`.
+
+After approval, `normalize_permissions` requires that exact token. Before the
+first source change it creates and verifies a private, durable backup under:
+
+`/local_apps/.dji-source-updater/permissions-<baseline-manifest-sha256>/`
+
+- `original.json` records original source identities, hashes and modes plus
+  preserved-extra metadata. Original 0666 modes are **audit information only**.
+- `original/<sha256-of-filename>.blob` contains original source bytes at mode
+  0600 inside 0700 directories. No extra-file contents are opened or backed up.
+- `ready.json` binds the completed backup to the original metadata record.
+- `intent-<sha256-of-filename>.json` is durably written before that file's chmod.
+  It records the fixed 0644 target and original bound file identity.
+
+The only source mutation is `fchmod` to 0644 on a read-only, no-follow descriptor
+for a verified baseline file currently at 0666. Files already 0644 are skipped.
+No content is replaced, no pathname/recursive chmod is used, no extra permissions
+are changed, and no app version, options, container or recording control is
+changed. Backups contain private configuration bytes and must never be published.
+
+Interrupted mixed 0666/0644 states can resume only when original identities,
+hashes, ownership, sizes, mtimes and extra metadata are unchanged, and any
+0666-to-0644 mode/ctime transition has its durable intent. Unexpected changes,
+corrupt backups, missing intents or incomplete original metadata refuse for
+review. A pending initial metadata write that cannot be validated refuses while
+source remains untouched. Successful tightening is never undone on failure.
+
+Operator sequence:
+
+1. Obtain explicit approval for this exact permission-tightening action. Keep
+   the existing approved private extra list and export digest unchanged.
+2. Set `mode: inspect_permissions`, start once, and require exact baseline bytes
+   plus the expected 0666/0644 counts. Record its `permission_fingerprint`.
+3. Only while that approval remains applicable, set `mode: normalize_permissions`
+   and `expected_fingerprint` to the exact `perm:` token; start once.
+4. Require `permissions_normalized` or `permissions_already_0644`, zero files at
+   0666, and all baseline files at 0644. Reset mode to `inspect` and clear the
+   old fingerprint. Obtain a fresh ordinary source-update fingerprint before
+   proceeding with any versioned update.
+5. If interrupted, stop and run `inspect_permissions`. Resume the same approved
+   operation only if recovery validates and no authorization/scope changed.
+   Otherwise investigate; do not delete recovery records to bypass a refusal.
+
+There is deliberately **no inverse action that replays 0666**. Restoring those
+world-writable permissions would require separate approval and a different
+explicit operation. Ordinary source apply/rollback still requires and restores
+0644, using its own separate backup; it never consumes the original 0666 audit
+modes. This operation is not an extension of the accepted source baseline.
+
+Source writers must remain quiescent. Descriptor binding prevents a last-moment
+pathname replacement from redirecting chmod onto the replacement file. A hostile
+writer can still mutate the verified inode between its last check and the
+syscall. Post-checks then refuse; unknown bytes are preserved and any already
+completed tightening remains. Advisory locking is not a security boundary
+against another process with the same filesystem authority.
+
 ## Read-only source hash/mode mismatch report
 
 Version 1.0.3 expands only the existing `inspect` hash/mode refusal. If secure
