@@ -28,7 +28,11 @@ MAX_FILE = 16 * 1024 * 1024
 DIAGNOSTIC_SCAN_ENTRIES = 256
 DIAGNOSTIC_ROOT_ENTRIES = 256
 DIAGNOSTIC_SECONDS = 5.0
-DIAGNOSTIC_ENTRIES = 8
+DIAGNOSTIC_ENTRIES = 32
+EXTRA_FILES_MAX = 32
+EXTRA_FILE_MAX_BYTES = 16 * 1024 * 1024
+EXTRA_TOTAL_MAX_BYTES = 64 * 1024 * 1024
+EXTRA_NAME = re.compile(r"\.?[A-Za-z0-9][A-Za-z0-9_.-]{0,126}\Z")
 DIAGNOSTIC_NAME_CHARS = 96
 DIAGNOSTIC_NAME_JSON_BYTES = 256
 DIAGNOSTIC_REPORT_BYTES = 8192
@@ -124,6 +128,30 @@ def parse_config(name, data):
         raise Refused("Invalid application config") from None
 
 
+def validate_extra_names(value, source_names):
+    require(isinstance(value, list) and len(value) <= EXTRA_FILES_MAX, "Invalid preserved-extra allowlist")
+    require(all(isinstance(name, str) and EXTRA_NAME.fullmatch(name) for name in value),
+            "Preserved-extra names must be simple single-component ASCII filenames")
+    folded = [name.casefold() for name in value]
+    require(len(set(folded)) == len(folded), "Duplicate or aliased preserved-extra names")
+    require(not (set(folded) & {name.casefold() for name in source_names}), "Preserved extra overlaps reviewed source")
+    controls = {"dockerfile", "containerfile", "build", "makefile", "gnumakefile", "cmakelists.txt",
+                "setup.py", "pipfile", "pipfile.lock", "poetry.lock", "uv.lock", "yarn.lock",
+                "pnpm-lock.yaml", "package.json", "package-lock.json", "requirements.txt", "constraints.txt"}
+    for name in folded:
+        require(name not in controls and not name.endswith((".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf")) and
+                not name.startswith((".git", ".docker", ".env", STORE)) and
+                not (name.endswith(".txt") and name.startswith(("requirements", "constraints"))),
+                "Config or build-control files may not be preserved extras")
+    return tuple(sorted(value))
+
+
+def extra_metadata(st):
+    return {"device": st.st_dev, "inode": st.st_ino, "mode": st.st_mode,
+            "links": st.st_nlink, "size": st.st_size, "uid": st.st_uid, "gid": st.st_gid,
+            "mtime_ns": st.st_mtime_ns, "ctime_ns": st.st_ctime_ns}
+
+
 def validate_manifest(manifest):
     require(set(manifest) == {"schema", "slug", "config", "baseline", "payload"}, "Invalid manifest fields")
     require(manifest["schema"] == 1 and manifest["slug"] == "dji_audio_archive", "Unsupported manifest identity")
@@ -145,7 +173,7 @@ def validate_manifest(manifest):
 
 
 class Updater:
-    def __init__(self, root, bundle, export_digest=""):
+    def __init__(self, root, bundle, export_digest="", preserve_extra_files=None):
         self.rootpath = str(root)
         self.bundlepath = Path(bundle)
         self.manifest = json.loads((self.bundlepath / "manifest.json").read_bytes())
@@ -156,6 +184,7 @@ class Updater:
         self.base = self.manifest["baseline"]["files"]
         self.target = self.manifest["payload"]["files"]
         self.names = sorted(self.target)
+        self.extra_names = validate_extra_names([] if preserve_extra_files is None else preserve_extra_files, self.names)
         self.config = self.manifest["config"]
         # Commit the visible version last. On rollback, restore it last as well.
         self.changed = [n for n in self.names if self.base.get(n) != self.target[n] and n != self.config]
@@ -276,8 +305,12 @@ class Updater:
             result["link_count"] = st.st_nlink
         return result
 
-    def diagnose(self):
-        """Read names/lstat metadata only; never approve source or issue a fingerprint."""
+    def diagnose(self, offset=0, snapshot=""):
+        """Metadata-only pages; diagnostic tokens never authorize source writes."""
+        require(type(offset) is int and 0 <= offset < DIAGNOSTIC_SCAN_ENTRIES, "Invalid diagnostic offset")
+        require(isinstance(snapshot, str) and (not snapshot or re.fullmatch(r"diag:[0-9a-f]{64}", snapshot)),
+                "Invalid diagnostic snapshot token")
+        require(offset == 0 or snapshot, "Diagnostic continuation requires its snapshot token")
         deadline = time.monotonic() + DIAGNOSTIC_SECONDS
         with self.directory(self.rootpath) as root:
             child, _, ident = self.discover(root, DIAGNOSTIC_ROOT_ENTRIES, deadline)
@@ -288,41 +321,78 @@ class Updater:
                     entries = {entry.name for entry in itertools.islice(scan, DIAGNOSTIC_SCAN_ENTRIES)}
                 listing_truncated = len(entries) == DIAGNOSTIC_SCAN_ENTRIES
                 unknown = sorted(entries - set(self.names))
-                selected = unknown[:DIAGNOSTIC_ENTRIES]
                 metadata = {}
-                for name in selected:
+                for name in unknown:
                     check_diagnostic_budget(deadline)
                     metadata[name] = os.stat(name, dir_fd=app, follow_symlinks=False)
+                token = "diag:" + digest(canonical({"directory": before, "entries": sorted(entries),
+                                                     "unknown": {n: extra_metadata(st) for n, st in metadata.items()}}))
+                require(not snapshot or snapshot == token, "Diagnostic snapshot changed; restart diagnosis at offset zero")
+                require(offset < len(unknown) or offset == 0, "Diagnostic offset exceeds listed entries")
                 result = {"status": "diagnostic_only", "source_verified": False,
-                          "entries_scanned": len(entries), "listing_truncated": listing_truncated,
+                          "diagnostic_snapshot": token, "offset": offset, "next_offset": None,
+                          "complete": False, "entries_scanned": len(entries), "listing_truncated": listing_truncated,
                           "unexpected_count": len(unknown), "unexpected_count_is_exact": not listing_truncated,
-                          "reported_count": len(selected), "omitted_count_at_least": len(unknown) - len(selected),
-                          "unexpected_entries": [self.diagnostic_entry(name, metadata[name]) for name in selected]}
-                # Do not call capture/guard: they open source contents and
-                # correctly refuse extra entries. This mode is metadata-only.
+                          "reported_count": 0, "omitted_count_at_least": len(unknown), "unexpected_entries": []}
+                # Add as many exact metadata records as fit, up to the fixed
+                # per-page limit. Reserve space for final counters/continuation.
+                for name in unknown[offset:offset + DIAGNOSTIC_ENTRIES]:
+                    check_diagnostic_budget(deadline)
+                    result["unexpected_entries"].append(self.diagnostic_entry(name, metadata[name]))
+                    if len(json.dumps(result, sort_keys=True, ensure_ascii=True).encode("ascii")) > DIAGNOSTIC_REPORT_BYTES - 128:
+                        result["unexpected_entries"].pop()
+                        break
+                count = len(result["unexpected_entries"])
+                require(count > 0 or not unknown, "Diagnostic record exceeds output limit")
+                end = offset + count
+                result["reported_count"] = count
+                result["omitted_count_at_least"] = len(unknown) - end
+                result["next_offset"] = end if end < len(unknown) else None
+                result["complete"] = not listing_truncated and end == len(unknown)
+                # Recheck the entire scanned metadata snapshot, including
+                # omitted entries, so pagination never blesses a changing list.
                 with self.directory(self.rootpath) as current_root:
                     require(inode(os.fstat(current_root)) == inode(os.fstat(root)), "Source mount replaced")
                 require(inode(os.stat(child, dir_fd=root, follow_symlinks=False)) == ident, "Target directory replaced")
                 require(self.discover(root, DIAGNOSTIC_ROOT_ENTRIES, deadline) == (child, self.config, ident), "Target discovery changed")
                 with os.scandir(app) as scan:
                     after_entries = {entry.name for entry in itertools.islice(scan, DIAGNOSTIC_SCAN_ENTRIES)}
-                require(entries == after_entries and before == signature(os.fstat(app)),
-                        "Target entries changed during diagnosis")
+                require(entries == after_entries and before == signature(os.fstat(app)), "Target entries changed during diagnosis")
                 for name, expected in metadata.items():
                     check_diagnostic_budget(deadline)
-                    require(signature(os.stat(name, dir_fd=app, follow_symlinks=False)) == signature(expected),
+                    require(extra_metadata(os.stat(name, dir_fd=app, follow_symlinks=False)) == extra_metadata(expected),
                             "Target entry changed during diagnosis")
                 check_diagnostic_budget(deadline)
                 require(len(json.dumps(result, sort_keys=True, ensure_ascii=True).encode("ascii")) <= DIAGNOSTIC_REPORT_BYTES,
                         "Diagnostic metadata exceeds output limit")
                 return result
 
+    def capture_extra_metadata(self, app):
+        result = {}
+        total = 0
+        for name in self.extra_names:
+            st = os.stat(name, dir_fd=app, follow_symlinks=False)
+            require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1, "Preserved extras must be regular single-link files")
+            require(stat.S_IMODE(st.st_mode) in (0o600, 0o644), "Unsafe preserved-extra permissions")
+            require(0 <= st.st_size <= EXTRA_FILE_MAX_BYTES, "Preserved extra exceeds size limit")
+            total += st.st_size
+            require(total <= EXTRA_TOTAL_MAX_BYTES, "Preserved extras exceed total size limit")
+            result[name] = extra_metadata(st)
+        return result
+
     def capture(self, app):
         self.app_identity = inode(os.fstat(app))
         entries = set(os.listdir(app))
-        require(entries <= set(self.names), "Unexpected files or directories in target app")
+        require(entries <= set(self.names) | set(self.extra_names), "Unexpected files or directories in target app")
         require(set(self.base) <= entries, "Baseline source file missing")
-        return {name: read_at(app, name) for name in self.names}
+        require(set(self.extra_names) <= entries, "Preserved extra missing")
+        extras = self.capture_extra_metadata(app)
+        current = {name: read_at(app, name) for name in self.names}
+        require(extras == self.capture_extra_metadata(app), "Preserved extra changed during source capture")
+        # Metadata is captured with this snapshot, never written into shared
+        # expected state by a later guard. Extras are never opened for content.
+        current["_preserved_extras"] = extras
+        return current
 
     def classify(self, current):
         observed = {name: file_info(current[name]) for name in self.names}
@@ -339,7 +409,8 @@ class Updater:
         require(cfg.get("slug") == self.manifest["slug"], "Unexpected target identity")
         require(str(cfg.get("version")) in (self.manifest["baseline"]["version"], self.manifest["payload"]["version"]),
                 "Unsupported source version")
-        fingerprint = digest(canonical({"bundle": self.bundle_id, "target_inode": self.app_identity, "files": observed}))
+        fingerprint = digest(canonical({"bundle": self.bundle_id, "target_inode": self.app_identity, "files": observed,
+                                        "preserve_extra_files": self.extra_names, "extra_metadata": current["_preserved_extras"]}))
         return phase, fingerprint
 
     def guard(self, root, child, app, expected):
@@ -349,6 +420,7 @@ class Updater:
         found = self.discover(root)
         require(found[0] == child and found[2] == inode(os.fstat(app)), "Target discovery changed")
         now = self.capture(app)
+        require(now["_preserved_extras"] == expected["_preserved_extras"], "Concurrent preserved-extra modification detected")
         for name in self.names:
             a, b = expected[name], now[name]
             require((a is None and b is None) or
@@ -363,9 +435,10 @@ class Updater:
                 "baseline_version": self.manifest["baseline"]["version"],
                 "payload_version": self.manifest["payload"]["version"],
                 "whitelisted_files": len(self.names), "changed_files": len(self.changed),
+                "preserved_extra_files": len(self.extra_names),
                 "recovery_available": recovery}
 
-    def existing_backup(self, root, phase):
+    def existing_backup(self, root, phase, extras):
         recovery = False
         if STORE in os.listdir(root):
             with self.directory(STORE, root) as store:
@@ -374,8 +447,9 @@ class Updater:
                     with self.directory(self.bundle_id, store) as transaction:
                         self.check_private_directory(transaction)
                         self.check_storage_entries(transaction)
+                        self.check_extra_record(transaction, extras, required=False)
                         if read_at(transaction, "ready.json") is not None:
-                            self.check_backup(transaction)
+                            self.check_backup(transaction, extras)
                             self.check_journal(transaction, phase)
                             recovery = True
                         else:
@@ -391,7 +465,7 @@ class Updater:
                 current = self.capture(app)
                 phase, fingerprint = self.classify(current)
                 self.guard(root, child, app, current)
-                return self.report(phase, fingerprint, self.existing_backup(root, phase))
+                return self.report(phase, fingerprint, self.existing_backup(root, phase, current["_preserved_extras"]))
 
     @staticmethod
     def check_private_directory(fd):
@@ -448,7 +522,19 @@ class Updater:
     def backup_name(self, name):
         return digest(name.encode()) + ".blob"
 
-    def check_backup(self, transaction):
+    def check_extra_record(self, transaction, extras, required=True):
+        saved = read_at(transaction, "extras.json")
+        if saved is None:
+            if extras:
+                pending = read_at(transaction, "extras.json.pending")
+                require(pending is None or pending[0] == canonical({"files": extras}),
+                        "Incomplete preserved-extra metadata requires review")
+            require(not required or not extras, "Preserved-extra recovery metadata missing")
+        else:
+            require(saved[0] == canonical({"files": extras}), "Preserved-extra recovery metadata changed")
+
+    def check_backup(self, transaction, extras):
+        self.check_extra_record(transaction, extras)
         saved = read_at(transaction, "review.json")
         require(saved is not None and saved[0] == canonical(self.manifest), "Recovery manifest missing/mismatched")
         with self.directory("original", transaction) as original:
@@ -460,7 +546,7 @@ class Updater:
                 require(item is not None and digest(item[0]) == info["sha256"], "Recovery backup hash mismatch")
 
     def check_storage_entries(self, transaction):
-        names = {"review.json", "ready.json", "journal.json", "journal.next", "conflict.json"}
+        names = {"review.json", "ready.json", "journal.json", "journal.next", "conflict.json", "extras.json"}
         names |= {self.stage_name(n) for n in self.changed}
         require(set(os.listdir(transaction)) <= names | {n + ".pending" for n in names} | {"original", "retired"},
                 "Unexpected recovery transaction contents")
@@ -494,12 +580,16 @@ class Updater:
     def prepare_backup(self, transaction, current):
         self.check_storage_entries(transaction)
         if read_at(transaction, "ready.json") is not None:
-            self.check_backup(transaction)
+            self.check_backup(transaction, current["_preserved_extras"])
             self.check_journal(transaction, self.classify(current)[0])
             return
         # No live mutation is allowed until ready.json is durable. Incomplete
         # preparation is resumable only from the exact baseline.
         require(self.classify(current)[0] == "baseline", "Incomplete backup requires unchanged baseline")
+        if read_at(transaction, "extras.json") is None:
+            self.write_new(transaction, "extras.json", canonical({"files": current["_preserved_extras"]}))
+        else:
+            self.check_extra_record(transaction, current["_preserved_extras"])
         saved = read_at(transaction, "review.json")
         if saved is None:
             self.write_new(transaction, "review.json", canonical(self.manifest))
@@ -519,7 +609,7 @@ class Updater:
                     self.discard_pending(original, blob + ".pending")
         finally:
             os.close(original)
-        self.check_backup(transaction)
+        self.check_backup(transaction, current["_preserved_extras"])
         self.write_new(transaction, "ready.json", canonical({"bundle": self.bundle_id}))
 
     def set_state(self, transaction, phase):
@@ -532,10 +622,10 @@ class Updater:
         os.replace(temp, "journal.json", src_dir_fd=transaction, dst_dir_fd=transaction)
         os.fsync(transaction)
 
-    def verify_storage(self, root, store, transaction):
+    def verify_storage(self, root, store, transaction, extras):
         require(inode(os.stat(STORE, dir_fd=root, follow_symlinks=False)) == inode(os.fstat(store)), "Recovery storage replaced")
         require(inode(os.stat(self.bundle_id, dir_fd=store, follow_symlinks=False)) == inode(os.fstat(transaction)), "Recovery transaction replaced")
-        self.check_backup(transaction)
+        self.check_backup(transaction, extras)
         self.check_storage_entries(transaction)
 
     def stage_name(self, name):
@@ -579,7 +669,7 @@ class Updater:
         require(staged is not None and staged[0] == data and stat.S_IMODE(staged[1].st_mode) == mode, "Staging verification failed")
         hook("before_replace", name)
         self.guard(root, child, app, expected)
-        self.verify_storage(root, store, transaction)
+        self.verify_storage(root, store, transaction, expected["_preserved_extras"])
         previous = expected[name]
         if previous is None:
             # A concurrent creation cannot be overwritten, even in the final
@@ -608,7 +698,7 @@ class Updater:
 
     def restore(self, root, child, app, store, transaction, current, hook):
         self.classify(current)  # Never overwrite unknown edits.
-        self.verify_storage(root, store, transaction)
+        self.verify_storage(root, store, transaction, current["_preserved_extras"])
         self.set_state(transaction, "rolling_back")
         for name in self.changed:
             if file_info(current[name]) == self.base.get(name):
@@ -617,7 +707,7 @@ class Updater:
             if name not in self.base:
                 hook("before_remove", name)
                 self.guard(root, child, app, current)
-                self.verify_storage(root, store, transaction)
+                self.verify_storage(root, store, transaction, current["_preserved_extras"])
                 previous = current[name]
                 temp = self.stage_name(name)
                 rename_atomic(app, name, transaction, temp)
@@ -652,7 +742,7 @@ class Updater:
                 phase, actual = self.classify(current)
                 require(actual == fingerprint, "Preflight fingerprint changed")
                 self.guard(root, child, app, current)
-                recovery = self.existing_backup(root, phase)
+                recovery = self.existing_backup(root, phase, current["_preserved_extras"])
                 if phase == "payload" and mode == "apply":
                     return self.report("already_applied", actual, recovery)
                 if phase == "baseline" and mode == "rollback":
@@ -668,7 +758,7 @@ class Updater:
                     transaction = self.mkdir_at(store, self.bundle_id)
                     try:
                         self.prepare_backup(transaction, current)
-                        self.verify_storage(root, store, transaction)
+                        self.verify_storage(root, store, transaction, current["_preserved_extras"])
                         self.recover_staging(transaction)
                         if phase == "mixed" or mode == "rollback":
                             self.restore(root, child, app, store, transaction, current, hook)
@@ -679,7 +769,7 @@ class Updater:
                                 self.replace_file(root, child, app, store, transaction, current, name,
                                                   self.payload[name], self.target[name]["mode"], hook)
                             require(self.classify(current)[0] == "payload", "Final source verification failed")
-                            self.verify_storage(root, store, transaction)
+                            self.verify_storage(root, store, transaction, current["_preserved_extras"])
                             self.set_state(transaction, "applied")
                         except ConcurrentRace:
                             raise
@@ -709,11 +799,12 @@ def main():
     args = parser.parse_args()
     try:
         options = json.loads(Path(args.options).read_bytes())
-        require(set(options) <= {"mode", "expected_fingerprint", "transcript_export_token_sha256"}, "Unexpected updater option")
+        require(set(options) <= {"mode", "expected_fingerprint", "transcript_export_token_sha256", "preserve_extra_files", "diagnostic_offset", "diagnostic_snapshot"}, "Unexpected updater option")
         mode = options.get("mode", "inspect")
-        updater = Updater(args.root, args.bundle, options.get("transcript_export_token_sha256", ""))
+        updater = Updater(args.root, args.bundle, options.get("transcript_export_token_sha256", ""),
+                          options.get("preserve_extra_files", []))
         if mode == "diagnose":
-            result = updater.diagnose()
+            result = updater.diagnose(options.get("diagnostic_offset", 0), options.get("diagnostic_snapshot", ""))
         elif mode == "inspect":
             result = updater.inspect()
         else:

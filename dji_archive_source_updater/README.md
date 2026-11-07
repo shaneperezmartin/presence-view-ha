@@ -23,45 +23,113 @@ app data. The fixed payload upgrades the original reviewed DJI Audio Archive
   quiescent during apply/recovery. The running recorder may continue recording:
   this changes its source tree, not its running image or `/data`.
 
-## Read-only diagnosis of unexpected entries
+## Read-only diagnosis and continuation
 
 If `inspect` refuses because the target contains unexpected files/directories,
-set `mode: diagnose` and start the updater once. This is diagnostic only: it
-never approves source, produces an apply fingerprint, changes the whitelist,
-reads unknown contents, follows unknown symlinks, enters unknown directories,
-or writes source/recovery data. Target discovery still requires the unique
-archive slug and the existing no-follow checks.
+set `mode: diagnose`, `diagnostic_offset: 0`, and `diagnostic_snapshot: ""`.
+Start once. Diagnosis never approves source, produces an apply fingerprint,
+changes the whitelist, follows unexpected symlinks, reads their targets or
+unexpected file contents, enters unexpected directories, or writes recovery or
+source data. Existing config reads are still needed for unique-slug discovery.
 
-After the existing bounded config reads needed for unique-slug discovery, the
-diagnostic scans at most 256 target-directory entries and reports up to 8
-unexpected direct-child names and their lstat type/mode. A scan reaching 256
-entries conservatively reports a truncated listing and lower-bound counts. Regular files also have size and link count. No symlink targets,
-file contents, unknown content hashes, owners, timestamps, or child listings are
-reported. Names are JSON-escaped, limited to 96 characters and 256 escaped
-bytes; truncated names include a filename-only SHA-256 for identification.
-Every reported entry includes its exact filename bytes encoded as base64, even
-when the display name is truncated or contains invalid UTF-8.
-Total output is limited to 8192 bytes; omitted-entry counts are explicit.
-The final consistency recheck has the same 256-entry target-directory bound.
-Diagnostic discovery refuses more than 256 local-root entries (using one
-lookahead entry). A five-second cooperative budget is checked between filesystem
-operations; it cannot interrupt a blocked kernel filesystem call. The existing
-config reads identify the target; no unexpected-entry contents are read.
-Concurrent directory/reported-entry changes cause refusal rather than a stale
-success result. Filename metadata is private runtime information: do not copy
-it into a public issue, source bundle or repository.
+The diagnostic scans at most 256 direct target-directory entries and gathers
+lstat metadata for the unexpected names. Each JSON page includes as many names
+as fit within 8192 bytes, up to 32 names. Each entry has its type/mode; regular
+files also have size/link count. No contents, content hashes, symlink targets,
+child listings, owners or timestamps are reported. Display names are
+JSON-escaped and bounded to 96 characters/256 escaped bytes. Exact filename
+bytes are always available as base64, including invalid UTF-8 or truncated
+previews. A truncated preview also has a filename-only SHA-256.
 
-A diagnostic result is not permission to remove an entry or accept different
-source. Investigate the result, then retain the original strict `inspect` and
-fingerprint-gated `apply` workflow. The default mode remains `inspect`.
+If `next_offset` is an integer, retain the exact `diagnostic_snapshot` token,
+set `diagnostic_offset` to `next_offset`, set `diagnostic_snapshot` to that token,
+and run `diagnose` again. The token begins with `diag:` and cannot be an apply
+fingerprint. It binds the target directory, scanned membership and full stat
+metadata of **all** scanned unexpected entries, including omitted ones.
+Changed membership/metadata refuses continuation: restart at offset zero with
+an empty token and reassess the complete new result. Do not combine pages from
+different snapshots. Only `complete: true` confirms the final page of a complete
+listing; it says nothing about source acceptance.
+
+Reaching the 256-entry target scan cap conservatively reports
+`listing_truncated: true`, lower-bound counts and `complete: false`, even on the
+last available page. The updater cannot enumerate beyond this cap: stop and
+investigate rather than treating it as a complete diagnosis. Diagnostic root
+discovery refuses more than 256 entries, using one lookahead entry. A shared
+five-second cooperative time budget is checked between filesystem operations;
+it cannot interrupt a blocked kernel filesystem call. The bounded final recheck
+validates the full scanned metadata snapshot before emitting a page.
+
+Diagnostic filenames are private runtime data. Do not copy them into public
+issues, source bundles or repositories. They never appear in public defaults.
+
+## Explicit preservation of reviewed regular extras
+
+The private option `preserve_extra_files` defaults to an empty list. It does not
+remove files or accept arbitrary source changes. Leave it empty until a complete
+diagnostic has been reviewed and the exact files are explicitly approved for
+preservation. This is appropriate only for unmanaged files that are not active
+source or build controls for the fixed reviewed archive build/runtime.
+
+Allowed names are exact single-component ASCII filenames, at most 128
+characters, starting with an alphanumeric character or one leading dot followed
+by an alphanumeric character. Only alphanumerics, dots, hyphens and underscores
+are allowed. Maximum 32 names; no duplicates, case aliases, path separators,
+parent traversal or overlap with any original/new source name is accepted.
+Config formats (`.json`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf`), known
+build-control filenames, dependency requirement/control names, and `.git*`,
+`.docker*`, `.env*` or updater storage/control names are refused. Inert legacy
+scripts or backup files are not rejected solely because of their extension.
+
+Every listed extra must exist as a regular, single-link file with mode 0600 or
+0644. Symlinks, hardlinks, directories, devices, FIFOs, sockets, executable or
+writable-by-group/others modes and special permission bits are refused. Limits
+are 16 MiB per file and 64 MiB total. Unlisted extras still refuse. A denied name,
+type or limit is not permission to rename, delete or normalize the file.
+
+The updater never opens preserved extras for contents, copies their contents to
+backup, hashes their contents, writes, changes permissions, renames, deletes or
+executes them. The fixed reviewed Dockerfiles copy an explicit source whitelist,
+so preserved extras are not copied into the resulting archive image, and the
+running app does not mount the source directory. This is **not** a promise that
+Docker cannot read/package them while preparing its local build context.
+
+Preflight fingerprints bind the canonical exact name list and each extra's
+filesystem device/inode, full mode, link count, size, ownership, modification
+time and change time. Guards compare fresh metadata against the immutable source
+snapshot before/after writes. Replacing or changing an extra invalidates the
+fingerprint. Even with approved extras, all original source hashes/modes remain
+strictly required. No new source baseline is learned from diagnosis or extras.
+
+Before source mutation, private `extras.json` durably records only the bound
+names/stat metadata in recovery storage. Recovery and later runs require that
+same metadata; they cannot silently rebaseline extras changed after interruption.
+A partial initial metadata write that cannot be validated refuses for review
+while original source is still untouched. The record contains private filenames
+and must never be published. Apply and rollback affect only the reviewed source
+whitelist; unchanged extras retain their original bytes, inode and metadata.
+
+Operator sequence:
+
+1. Diagnose at offset zero, follow snapshot-bound pages if needed, and require a
+   complete stable listing. Assess every extra; do not infer approval from type.
+2. Only after explicit approval, privately set `preserve_extra_files` to the
+   exact approved names. Keep the same list for inspection, apply and rollback.
+   No live filename is authorized by this public package or its examples.
+3. Reset `diagnostic_offset: 0` and `diagnostic_snapshot: ""`; set `mode: inspect`.
+   Require the unchanged reviewed baseline and a fresh source fingerprint.
+4. Use that fingerprint for `apply` under the existing rollout procedure below.
+   If any source/extra metadata changes, stop and investigate; never substitute
+   hashes, remove unknown files, or enlarge the list automatically.
 
 ## What is accepted
 
 The updater discovers a direct child of `/local_apps` by its config
 `slug: dji_audio_archive`; the folder name is not assumed to match the installed
 identifier. Exactly one matching app and one config are required. Target source
-must be exactly the manifest whitelist, with reviewed SHA-256 and permissions.
-Missing/extra files or directories, unsupported versions, hardlinks, symlinks,
+must have the exact reviewed source whitelist/hashes/modes, plus only explicitly
+approved preserved regular extras described above. Missing/unlisted files or
+directories, unsupported versions, hardlinks, symlinks,
 FIFOs/devices, oversized files, unexpected configs, and ambiguous targets refuse
 without deleting unrelated files. An unexpected file is a reason to investigate,
 not permission to remove it. Other app files are never modified.
@@ -139,6 +207,9 @@ private defaults, so **do not publish or upload recovery storage**.
 
 - `review.json` records the exact hash/mode whitelist, not original source text.
 - `original/<sha256-of-filename>.blob` contains each original source file.
+- `extras.json` records approved extra filenames/stat metadata only, never their
+  contents. It is required for preserved-extra recovery; old empty-extra backups
+  remain compatible.
 - `ready.json` proves completed/verified backup preparation.
 - `journal.json` records apply/rollback phase and bundle hash.
 - `replacement-*.blob` are staged or atomically displaced files.
@@ -218,7 +289,8 @@ The tests use temporary synthetic trees only. They cover exact write scope,
 config-last ordering, inspect-only behavior, duplicate slugs, strict manifests,
 symlink/hardlink/FIFO rejection, root/app swaps, final-syscall races, retained
 late-writer bytes, corrupted backups/journals, every mid-write power cut,
-interrupted rollback, idempotence and private-default customization.
+interrupted rollback, idempotence, private-default customization, bounded
+diagnostic pagination, and exact preserve-only extras across interruption.
 
 `tools/assemble.py` accepts a reviewed baseline hash/mode manifest, a public
 payload source directory, an explicit JSON filename whitelist, and an empty

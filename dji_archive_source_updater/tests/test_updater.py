@@ -484,8 +484,9 @@ class UpdaterTests(unittest.TestCase):
             name="\U0001f600"*61+str(i)
             (self.app/name).write_bytes(b"hidden")
         report=self.updater.diagnose()
-        self.assertEqual(report["reported_count"],u.DIAGNOSTIC_ENTRIES)
-        self.assertEqual(report["omitted_count_at_least"],12-u.DIAGNOSTIC_ENTRIES)
+        self.assertGreater(report["reported_count"],0)
+        self.assertLessEqual(report["reported_count"],u.DIAGNOSTIC_ENTRIES)
+        self.assertEqual(report["omitted_count_at_least"],12-report["reported_count"])
         self.assertTrue(report["unexpected_count_is_exact"])
         self.assertLessEqual(len(json.dumps(report,sort_keys=True,ensure_ascii=True).encode("ascii")),u.DIAGNOSTIC_REPORT_BYTES)
         for item in report["unexpected_entries"]:
@@ -573,6 +574,263 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(len(lines),1)
         self.assertEqual(json.loads(lines[0])["status"],"diagnostic_only")
         self.assertFalse((self.root/u.STORE).exists())
+
+    def make_extras(self, names=("legacy-stage.bin",), mode=0o644):
+        for name in names:
+            (self.app/name).write_bytes(b"UNREAD EXTRA CONTENT " + name.encode())
+            (self.app/name).chmod(mode)
+        self.updater=u.Updater(self.root,self.bundle,preserve_extra_files=list(names))
+        return {name:u.extra_metadata((self.app/name).lstat()) for name in names}
+
+    def assert_extras_unchanged(self, expected):
+        self.assertEqual({name:u.extra_metadata((self.app/name).lstat()) for name in expected},expected)
+
+    def assert_reviewed_source(self, expected):
+        self.assertEqual({name:(self.app/name).read_bytes() for name in expected},expected)
+        self.assertEqual(set(p.name for p in self.app.iterdir()),set(expected)|set(self.updater.extra_names))
+
+    def test_diagnostic_dynamic_page_contains_fifteen_short_names(self):
+        for i in range(15): (self.app/("legacy-stage-%02d.bak"%i)).touch()
+        report=self.updater.diagnose()
+        self.assertEqual(report["reported_count"],15)
+        self.assertTrue(report["complete"])
+        self.assertIsNone(report["next_offset"])
+        self.assertTrue(report["diagnostic_snapshot"].startswith("diag:"))
+        self.assertNotIn("source_fingerprint",report)
+
+    def test_diagnostic_pages_cover_exact_all_names(self):
+        expected=[]
+        for i in range(60):
+            name="\U0001f600"*60+str(i)
+            expected.append(os.fsencode(name));(self.app/name).touch()
+        seen=[];offset=0;token=""
+        while True:
+            report=self.updater.diagnose(offset,token)
+            seen.extend(base64.b64decode(item["name_bytes_base64"]) for item in report["unexpected_entries"])
+            self.assertLessEqual(len(json.dumps(report,ensure_ascii=True).encode("ascii")),u.DIAGNOSTIC_REPORT_BYTES)
+            if report["next_offset"] is None:
+                self.assertTrue(report["complete"]);break
+            self.assertFalse(report["complete"])
+            self.assertGreater(report["next_offset"],offset)
+            offset=report["next_offset"];token=report["diagnostic_snapshot"]
+        self.assertEqual(sorted(seen),sorted(expected))
+        self.assertEqual(len(seen),len(set(seen)))
+
+    def test_diagnostic_continuation_requires_unchanged_metadata(self):
+        for i in range(45):(self.app/("legacy-item-%02d"%i)).touch()
+        first=self.updater.diagnose()
+        (self.app/"legacy-item-44").write_bytes(b"changed beyond first page")
+        with self.assertRaisesRegex(u.Refused,"snapshot changed"):
+            self.updater.diagnose(first["next_offset"],first["diagnostic_snapshot"])
+
+    def test_diagnostic_continuation_requires_unchanged_membership(self):
+        for i in range(45):(self.app/("legacy-item-%02d"%i)).touch()
+        first=self.updater.diagnose();(self.app/"new-member").touch()
+        with self.assertRaisesRegex(u.Refused,"snapshot changed"):
+            self.updater.diagnose(first["next_offset"],first["diagnostic_snapshot"])
+
+    def test_diagnostic_bad_cursors_refuse_and_token_cannot_apply(self):
+        for offset,token in ((True,""),(-1,""),(256,""),(1,""),(1,"a"*64),(0,"diag:bad"),(0,None)):
+            with self.subTest(offset=offset,token=token):
+                with self.assertRaises(u.Refused):self.updater.diagnose(offset,token)
+        report=self.updater.diagnose()
+        with self.assertRaises(u.Refused):self.updater.run("apply",report["diagnostic_snapshot"])
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_preserve_extra_name_validation(self):
+        bad=[{},"legacy.bin",["."],[".."],["../legacy.bin"],["./legacy.bin"],["nested/legacy.bin"],
+             ["nested\\legacy.bin"],["legacy.bin/"],["legacy.bin "],["legacy\n.bin"],["\u00e9.bin"],
+             ["..legacy.bin"],["%2e%2e.bin"],["x"*129],["one.bin","one.bin"],["One.bin","one.bin"],
+             ["server.py"],["SERVER.PY"],["export.py"],["config.json"],["config.yml"],[".dockerignore"],
+             ["Dockerfile"],["Dockerfile".upper()],["build.yaml"],["package.json"],["setup.py"],
+             ["requirements-dev.txt"],["Makefile"],[".env"],[".gitconfig"],["private.conf"],
+             ["item-%d.bin"%i for i in range(u.EXTRA_FILES_MAX+1)]]
+        for value in bad:
+            with self.subTest(value=value):
+                with self.assertRaises(u.Refused):u.Updater(self.root,self.bundle,preserve_extra_files=value)
+
+    def test_preserve_inert_scripts_and_backups_are_allowed(self):
+        metadata=self.make_extras(("old-deploy.ps1","old-helper.py","legacy-start.sh","old-source.bak","legacy.bin"))
+        self.assertEqual(self.updater.inspect()["preserved_extra_files"],5)
+        self.start();self.start("rollback")
+        self.assert_extras_unchanged(metadata)
+        self.assert_reviewed_source(self.baseline)
+
+    def test_preserve_extra_apply_rollback_never_reads_or_writes_extras(self):
+        metadata=self.make_extras(("legacy-a.bin",".legacy-b.bak"))
+        names=set(metadata);inodes={value["inode"] for value in metadata.values()}
+        original_open=u.os.open;original_rename=u.rename_atomic;original_write=u.os.write;original_unlink=u.os.unlink
+        def no_extra_open(path,*args,**kwargs):
+            self.assertNotIn(path,names,"Extra content opened")
+            return original_open(path,*args,**kwargs)
+        def no_extra_rename(srcfd,src,dstfd,dst,exchange=False):
+            self.assertNotIn(src,names);self.assertNotIn(dst,names)
+            return original_rename(srcfd,src,dstfd,dst,exchange)
+        def no_extra_write(fd,data):
+            self.assertNotIn(os.fstat(fd).st_ino,inodes)
+            return original_write(fd,data)
+        def no_extra_unlink(path,*args,**kwargs):
+            self.assertNotIn(path,names)
+            return original_unlink(path,*args,**kwargs)
+        with mock.patch.object(u.os,"open",no_extra_open),mock.patch.object(u,"rename_atomic",no_extra_rename), \
+             mock.patch.object(u.os,"write",no_extra_write),mock.patch.object(u.os,"unlink",no_extra_unlink):
+            preflight=self.updater.inspect();self.start();self.start("rollback")
+        self.assertNotIn("legacy",json.dumps(preflight))
+        self.assert_extras_unchanged(metadata);self.assert_reviewed_source(self.baseline)
+        blobs=list((self.transaction/"original").iterdir())
+        self.assertEqual(len(blobs),len(self.baseline))
+        for p in self.transaction.rglob("*"):
+            if p.is_file():self.assertNotIn(b"UNREAD EXTRA CONTENT",p.read_bytes())
+        self.assertEqual(json.loads((self.transaction/"extras.json").read_bytes()),{"files":metadata})
+
+    def test_preserve_missing_or_unlisted_extras_refuse(self):
+        self.make_extras()
+        with self.assertRaises(u.Refused):u.Updater(self.root,self.bundle).inspect()
+        (self.app/"unlisted.bin").touch()
+        with self.assertRaisesRegex(u.Refused,"Unexpected files"):self.updater.inspect()
+        (self.app/"unlisted.bin").unlink();(self.app/"legacy-stage.bin").unlink()
+        with self.assertRaisesRegex(u.Refused,"extra missing"):self.updater.inspect()
+
+    def test_preserve_symlink_fifo_directory_hardlink_refuse(self):
+        name="legacy.bin";p=self.app/name
+        updater=u.Updater(self.root,self.bundle,preserve_extra_files=[name])
+        p.symlink_to(self.other/"private-file")
+        with self.assertRaises(u.Refused):updater.inspect()
+        p.unlink();os.mkfifo(p)
+        with self.assertRaises(u.Refused):updater.inspect()
+        p.unlink();p.mkdir()
+        with self.assertRaises(u.Refused):updater.inspect()
+        p.rmdir();os.link(self.other/"private-file",p)
+        with self.assertRaises(u.Refused):updater.inspect()
+        self.assertEqual((self.other/"private-file").read_bytes(),b"unrelated")
+
+    def test_preserve_unsafe_modes_refuse(self):
+        self.make_extras()
+        p=self.app/"legacy-stage.bin"
+        for mode in (0o755,0o664,0o646,0o666,0o1644,0o2644,0o4644,0o000):
+            p.chmod(mode)
+            with self.subTest(mode=mode):
+                with self.assertRaises(u.Refused):self.updater.inspect()
+        p.chmod(0o600)
+        self.assertEqual(self.updater.inspect()["status"],"baseline")
+
+    def test_preserve_per_file_and_total_size_bounds(self):
+        self.make_extras()
+        with (self.app/"legacy-stage.bin").open("wb") as f:f.truncate(u.EXTRA_FILE_MAX_BYTES+1)
+        with self.assertRaisesRegex(u.Refused,"size limit"):self.updater.inspect()
+        (self.app/"legacy-stage.bin").unlink()
+        names=["large-%d.bin"%i for i in range(5)]
+        self.make_extras(names)
+        for name in names:
+            with (self.app/name).open("wb") as f:f.truncate(u.EXTRA_FILE_MAX_BYTES)
+        with self.assertRaisesRegex(u.Refused,"total size"):self.updater.inspect()
+
+    def test_preserve_fingerprint_binds_metadata_and_names(self):
+        self.make_extras()
+        first=self.updater.inspect()["source_fingerprint"]
+        (self.app/"legacy-stage.bin").write_bytes(b"changed")
+        second=self.updater.inspect()["source_fingerprint"]
+        self.assertNotEqual(first,second)
+        with self.assertRaisesRegex(u.Refused,"fingerprint changed"):self.updater.run("apply",first)
+        self.assertFalse((self.root/u.STORE).exists())
+        (self.app/"server.py").write_bytes(b"modified baseline")
+        with self.assertRaisesRegex(u.Refused,"Source hashes"):self.updater.inspect()
+
+    def test_preserve_capture_snapshot_is_not_mutated_by_guard(self):
+        self.make_extras()
+        with self.updater.directory(self.root) as root,self.updater.directory(self.app.name,root) as app:
+            expected=self.updater.capture(app)
+            original=json.loads(json.dumps(expected["_preserved_extras"]))
+            (self.app/"legacy-stage.bin").write_bytes(b"later")
+            with self.assertRaisesRegex(u.Refused,"preserved-extra modification"):
+                self.updater.guard(root,self.app.name,app,expected)
+            self.assertEqual(expected["_preserved_extras"],original)
+
+    def test_preserve_race_before_first_write_stops_without_blessing(self):
+        self.make_extras()
+        def race(e,n):
+            if e=="before_replace":(self.app/"legacy-stage.bin").write_bytes(b"concurrent extra")
+        with self.assertRaises(u.Refused):self.start(hook=race)
+        self.assert_reviewed_source(self.baseline)
+        again=u.Updater(self.root,self.bundle,preserve_extra_files=["legacy-stage.bin"])
+        with self.assertRaisesRegex(u.Refused,"recovery metadata changed"):again.inspect()
+        self.assertEqual((self.app/"legacy-stage.bin").read_bytes(),b"concurrent extra")
+
+    def test_preserve_normal_failure_rolls_back_source_only(self):
+        metadata=self.make_extras()
+        def fail(e,n):
+            if e=="after_replace" and n=="server.py":raise RuntimeError("synthetic failure")
+        with self.assertRaisesRegex(u.Refused,"baseline source restored"):self.start(hook=fail)
+        self.assert_extras_unchanged(metadata);self.assert_reviewed_source(self.baseline)
+
+    def test_preserve_interrupted_apply_and_rollback_are_recoverable(self):
+        metadata=self.make_extras()
+        def crash(e,n):
+            if e=="after_replace" and n=="server.py":raise Crash()
+        with self.assertRaises(Crash):self.start(hook=crash)
+        self.updater=u.Updater(self.root,self.bundle,preserve_extra_files=list(metadata))
+        self.assertEqual(self.updater.inspect()["status"],"mixed")
+        def crash_rollback(e,n):
+            if e=="after_remove":raise Crash()
+        with self.assertRaises(Crash):self.start("rollback",crash_rollback)
+        self.updater=u.Updater(self.root,self.bundle,preserve_extra_files=list(metadata))
+        self.assertEqual(self.start("rollback")["status"],"rolled_back")
+        self.assert_extras_unchanged(metadata);self.assert_reviewed_source(self.baseline)
+
+    def test_preserve_interrupted_recovery_never_rebaselines_changed_extra(self):
+        self.make_extras()
+        def crash(e,n):
+            if e=="after_replace":raise Crash()
+        with self.assertRaises(Crash):self.start(hook=crash)
+        (self.app/"legacy-stage.bin").write_bytes(b"changed after crash")
+        self.updater=u.Updater(self.root,self.bundle,preserve_extra_files=["legacy-stage.bin"])
+        with self.assertRaisesRegex(u.Refused,"recovery metadata changed"):self.updater.inspect()
+
+    def test_preserve_partial_backup_never_rebaselines_changed_extra(self):
+        self.make_extras()
+        original=self.updater.write_new
+        def crash(fd,name,data,mode=0o600):
+            original(fd,name,data,mode)
+            if name=="extras.json":raise Crash()
+        self.updater.write_new=crash
+        with self.assertRaises(Crash):self.start()
+        self.assert_reviewed_source(self.baseline)
+        (self.app/"legacy-stage.bin").write_bytes(b"changed after partial backup")
+        again=u.Updater(self.root,self.bundle,preserve_extra_files=["legacy-stage.bin"])
+        with self.assertRaisesRegex(u.Refused,"recovery metadata changed"):again.inspect()
+
+    def test_preserve_incomplete_metadata_write_refuses_safely(self):
+        self.make_extras()
+        original=u.os.write
+        def partial(fd,data):
+            original(fd,data[:max(1,len(data)//2)])
+            raise Crash()
+        with mock.patch.object(u.os,"write",partial):
+            with self.assertRaises(Crash):self.start()
+        self.assert_reviewed_source(self.baseline)
+        again=u.Updater(self.root,self.bundle,preserve_extra_files=["legacy-stage.bin"])
+        with self.assertRaisesRegex(u.Refused,"Incomplete preserved-extra metadata"):again.inspect()
+
+    def test_preserve_durable_metadata_exists_before_any_source_write(self):
+        metadata=self.make_extras()
+        def check(e,n):
+            if e=="before_replace":
+                self.assertEqual(json.loads((self.transaction/"extras.json").read_bytes()),{"files":metadata})
+                self.assertTrue((self.transaction/"ready.json").exists())
+        self.start(hook=check)
+        self.assert_extras_unchanged(metadata)
+
+    def test_preserve_corrupted_metadata_refuses_without_touching_source(self):
+        self.make_extras();self.start()
+        (self.transaction/"extras.json").write_bytes(b"bad")
+        with self.assertRaisesRegex(u.Refused,"recovery metadata changed"):self.updater.inspect()
+        self.assert_reviewed_source(self.payload)
+
+    def test_empty_allowlist_accepts_prior_no_extras_recovery(self):
+        self.start();(self.transaction/"extras.json").unlink()
+        self.assertEqual(self.updater.inspect()["status"],"payload")
+        self.assertEqual(self.start("rollback")["status"],"rolled_back")
+        self.assert_source(self.baseline)
 
 
 if __name__=="__main__":unittest.main()
