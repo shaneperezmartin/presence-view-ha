@@ -249,7 +249,7 @@ def reconstruct(configs,histories,start,end,zone):
     return result
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='PresenceView/0.2.1'
+    server_version='PresenceView/0.2.2'
     def log_message(self,*args): pass  # Do not retain private presence/query details.
     def do_GET(self):
         # HA ingress is the sole ingress route. No host port is published.
