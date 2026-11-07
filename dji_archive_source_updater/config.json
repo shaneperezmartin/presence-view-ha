@@ -1,0 +1,32 @@
+{
+  "name": "DJI Archive Source Updater",
+  "version": "1.0.0",
+  "slug": "dji_archive_source_updater",
+  "description": "Offline, manually started source-only updater with strict reviewed hashes",
+  "arch": [
+    "amd64"
+  ],
+  "startup": "once",
+  "boot": "manual",
+  "init": false,
+  "homeassistant_api": false,
+  "hassio_api": false,
+  "host_network": false,
+  "audio": false,
+  "map": [
+    {
+      "type": "local_apps",
+      "read_only": false
+    }
+  ],
+  "options": {
+    "mode": "inspect",
+    "expected_fingerprint": "",
+    "transcript_export_token_sha256": ""
+  },
+  "schema": {
+    "mode": "list(inspect|apply|rollback)",
+    "expected_fingerprint": "str",
+    "transcript_export_token_sha256": "str"
+  }
+}

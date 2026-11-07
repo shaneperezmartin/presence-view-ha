@@ -1,0 +1,139 @@
+"""Synthetic model-download security/lifecycle tests; no account or network."""
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+import model_setup as m
+
+TOKEN = "hf_" + "SyntheticTestOnly12345" * 2
+
+
+class ModelSetupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def fixture(self):
+        payload = b"synthetic model fixture"
+        return payload, {"weights.bin": (len(payload), "sha256", hashlib.sha256(payload).hexdigest())}
+
+    def test_integrity_checks_size_and_digest(self):
+        payload, files = self.fixture()
+        path = self.root / "weights.bin"
+        path.write_bytes(payload)
+        m.verify_file(path, files["weights.bin"])
+        path.write_bytes(payload.upper())
+        with self.assertRaises(ValueError): m.verify_file(path, files["weights.bin"])
+        path.write_bytes(b"short")
+        with self.assertRaises(ValueError): m.verify_file(path, files["weights.bin"])
+
+    def test_git_blob_integrity(self):
+        payload = b"readme"
+        path = self.root / "README.md"
+        path.write_bytes(payload)
+        m.verify_file(path, (len(payload), "git", hashlib.sha1(b"blob 6\0" + payload).hexdigest()))
+
+    def test_download_uses_pinned_repo_and_verifies_all_files(self):
+        payload, files = self.fixture()
+        def fetch(**kwargs):
+            self.assertEqual(kwargs["repo_id"], m.REPO)
+            self.assertEqual(kwargs["revision"], m.REVISION)
+            self.assertEqual(kwargs["token"], TOKEN)
+            target = Path(kwargs["local_dir"]) / kwargs["filename"]
+            target.write_bytes(payload)
+            return target
+        with patch.object(m, "FILES", files):
+            self.assertTrue(m.download(self.root, TOKEN, fetch, 0))
+            status = json.loads((self.root / "setup-state.json").read_text())
+            self.assertEqual(status["phase"], "downloaded")
+            self.assertEqual(status["completed_files"], 1)
+            self.assertFalse(status["speaker_labels_active"])
+            self.assertNotIn(TOKEN, json.dumps(status))
+
+    def test_failed_fetch_does_not_leak_exception_credentials(self):
+        error = RuntimeError("request Authorization Bearer " + TOKEN)
+        error.response = Mock(status_code=403)
+        self.assertFalse(m.download(self.root, TOKEN, Mock(side_effect=error), 0))
+        raw = (self.root / "setup-state.json").read_text()
+        self.assertNotIn(TOKEN, raw)
+        self.assertEqual(json.loads(raw)["error"], m.SAFE_ERRORS["access"])
+
+    def test_unexpected_download_path_rejected(self):
+        self.assertFalse(m.download(self.root, TOKEN, Mock(return_value=self.root / "elsewhere"), 0))
+        self.assertEqual(json.loads((self.root / "setup-state.json").read_text())["error"], m.SAFE_ERRORS["integrity"])
+
+    def test_storage_reserve_blocks_fetch(self):
+        fetch = Mock()
+        with patch.object(m.shutil, "disk_usage", return_value=Mock(free=1)):
+            self.assertFalse(m.download(self.root, TOKEN, fetch, 100))
+        fetch.assert_not_called()
+
+    def test_token_and_idle_gates_prevent_process_start(self):
+        setup = m.ModelSetup(self.root)
+        with patch.object(m.subprocess, "Popen") as popen:
+            for bad in (None, "", "hf_short", TOKEN + "\n", {"token": TOKEN}):
+                with self.assertRaises(ValueError): setup.start(bad, True)
+            with self.assertRaises(RuntimeError): setup.start(TOKEN, False)
+            popen.assert_not_called()
+
+    def test_token_uses_pipe_never_arguments_environment_or_status(self):
+        setup = m.ModelSetup(self.root)
+        proc = Mock()
+        proc.poll.return_value = None
+        proc.stdin = Mock()
+        with patch.dict(os.environ, {"HF_TOKEN": TOKEN, "SUPERVISOR_TOKEN": "synthetic-supervisor"}), patch.object(m.subprocess, "Popen", return_value=proc) as popen:
+            result = setup.start(TOKEN, True)
+            args, kwargs = popen.call_args
+            self.assertNotIn(TOKEN, str(args))
+            self.assertNotIn(TOKEN, str(kwargs))
+            self.assertNotIn("SUPERVISOR_TOKEN", kwargs["env"])
+            self.assertNotIn("HF_TOKEN", kwargs["env"])
+            self.assertEqual(kwargs["stdout"], m.subprocess.DEVNULL)
+            self.assertEqual(kwargs["stderr"], m.subprocess.DEVNULL)
+            proc.stdin.write.assert_called_once_with(TOKEN.encode() + b"\n")
+            proc.stdin.close.assert_called_once()
+            self.assertNotIn(TOKEN, json.dumps(result))
+            with self.assertRaises(RuntimeError): setup.start(TOKEN, True)
+            self.assertEqual(popen.call_count, 1)
+        for path in setup.root.rglob("*"):
+            if path.is_file(): self.assertNotIn(TOKEN.encode(), path.read_bytes())
+
+    def test_complete_model_cannot_be_overwritten(self):
+        setup = m.ModelSetup(self.root)
+        m.write_state(setup.root, "downloaded", len(m.FILES))
+        with patch.object(m.subprocess, "Popen") as popen:
+            with self.assertRaises(RuntimeError): setup.start(TOKEN, True)
+            popen.assert_not_called()
+
+    def test_restart_and_dead_worker_report_interrupted(self):
+        m.write_state(self.root / "models", "downloading", 2)
+        setup = m.ModelSetup(self.root)
+        self.assertEqual(setup.status()["phase"], "interrupted")
+        m.write_state(setup.root, "downloading", 3)
+        setup.proc = Mock()
+        setup.proc.poll.return_value = 1
+        self.assertEqual(setup.status()["phase"], "interrupted")
+        self.assertEqual(setup.status()["completed_files"], 3)
+
+    def test_status_does_not_return_arbitrary_stored_strings(self):
+        setup = m.ModelSetup(self.root)
+        stored = m.write_state(setup.root, "failed")
+        stored.update(error=TOKEN, message=TOKEN, unexpected=TOKEN)
+        (setup.root / "setup-state.json").write_text(json.dumps(stored))
+        self.assertNotIn(TOKEN, json.dumps(setup.status()))
+
+    def test_stop_terminates_worker(self):
+        setup = m.ModelSetup(self.root)
+        setup.proc = Mock()
+        setup.proc.poll.return_value = None
+        setup.stop()
+        setup.proc.terminate.assert_called_once()
+        self.assertEqual(setup.status()["phase"], "interrupted")
+
+
+if __name__ == "__main__": unittest.main()

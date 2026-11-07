@@ -1,0 +1,79 @@
+"""Synthetic exports only; no microphone, models or private transcript content."""
+import asyncio
+from datetime import datetime
+from http.server import ThreadingHTTPServer
+import io
+import tempfile
+import threading
+from types import SimpleNamespace
+import unittest
+import urllib.error
+import urllib.request
+from archive import Archive
+from presentation import formatted_chunks, friendly_name, interval
+from server import Handler
+
+
+class PresentationTests(unittest.TestCase):
+    def test_midnight_and_daylight_saving_boundaries(self):
+        self.assertEqual(interval(datetime.fromisoformat('2026-11-05T04:59:59.073+00:00'), datetime.fromisoformat('2026-11-05T05:00:02.344+00:00')),
+            '11-4-2026 11:59:59 PM EST – 11-5-2026 12:00:02 AM EST')
+        self.assertEqual(interval(datetime.fromisoformat('2026-11-01T05:59:59+00:00'), datetime.fromisoformat('2026-11-01T06:00:01+00:00')),
+            '11-1-2026 1:59:59 AM EDT – 11-1-2026 1:00:01 AM EST')
+        self.assertEqual(interval(datetime.fromisoformat('2026-07-01T16:00:00+00:00'), datetime.fromisoformat('2026-07-01T16:00:05+00:00')),
+            '7-1-2026 · 12:00:00 PM–12:00:05 PM EDT')
+
+    def test_names_are_readable_and_windows_safe(self):
+        name = friendly_name('20261105T045959.073000Z_ab123456.txt', 'upstairs', 'transcripts')
+        self.assertEqual(name, 'Upstairs Transcript - 11-4-2026 - 11-59-59 PM EST.txt')
+        for char in '<>:"/\\|?*': self.assertNotIn(char, name)
+        self.assertTrue(friendly_name('20261105T045959.073000Z_ab123456.aac.part', 'downstairs', 'audio').endswith(' - In progress.aac'))
+
+    def test_transcript_words_and_source_are_preserved(self):
+        original = ('DJI Upstairs | capture start 2026-11-05T04:59:59.073+00:00\n'
+            '[2026-11-05T04:59:59.073+00:00 - 2026-11-05T05:00:02.344+00:00] Speaker 2: Synthetic words 2026-11-05T05:00:02+00:00\n'
+            'Capture closed: 2026-11-05T05:00:04+00:00. Queued speech may finish below.\n'
+            'Speaker timeline (seconds from capture start):\n0.00-3.27: Speaker 2\n').encode()
+        source = io.BytesIO(original + b'NEW APPEND MUST NOT APPEAR\n')
+        result = b''.join(formatted_chunks(source, len(original))).decode()
+        self.assertIn('Started: 11-4-2026 11:59:59 PM EST', result)
+        self.assertIn('Speaker 2: Synthetic words 2026-11-05T05:00:02+00:00', result)
+        self.assertIn('Capture ended: 11-5-2026 12:00:04 AM EST.', result)
+        self.assertIn('Speaker timeline (New York time):', result)
+        self.assertNotIn('NEW APPEND', result)
+        self.assertEqual(source.getvalue(), original + b'NEW APPEND MUST NOT APPEAR\n')
+
+    def test_malformed_or_partial_metadata_still_downloads(self):
+        original = b'[2026-99-05T04:59:59+00:00 - 2026-11-05T05:00:02+00:00] keep\npartial'
+        self.assertEqual(b''.join(formatted_chunks(io.BytesIO(original), len(original))), original)
+
+    def test_real_http_download_keeps_audio_bytes_and_formats_text(self):
+        class LocalHandler(Handler):
+            def call(self, coro, timeout=15): return asyncio.run(coro)
+        with tempfile.TemporaryDirectory() as temp:
+            archive = Archive(temp)
+            epoch = datetime.fromisoformat('2026-11-05T05:00:02+00:00').timestamp()
+            transcript = archive.new('transcripts', 'upstairs', epoch, '.txt')
+            original = b'DJI Upstairs | capture start 2026-11-05T05:00:02+00:00\n'
+            transcript.write_bytes(original)
+            audio = archive.new('audio', 'downstairs', epoch, '.aac')
+            audio.write_bytes(b'generated audio fixture\x00\xff')
+            server = ThreadingHTTPServer(('127.0.0.1', 0), LocalHandler)
+            server.controller = SimpleNamespace(archive=archive)
+            worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+            base = f'http://127.0.0.1:{server.server_port}'
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                for kind, floor, path in [('transcripts', 'upstairs', transcript), ('audio', 'downstairs', audio)]:
+                    with opener.open(f'{base}/download/{kind}/{floor}/{path.name}') as response:
+                        data = response.read()
+                        self.assertEqual(len(data), int(response.headers['Content-Length']))
+                        self.assertIn(friendly_name(path.name, floor, kind), response.headers['Content-Disposition'])
+                        if kind == 'audio': self.assertEqual(data, path.read_bytes())
+                        else: self.assertIn(b'Started: 11-5-2026 12:00:02 AM EST', data)
+                self.assertEqual(transcript.read_bytes(), original)
+            finally:
+                server.shutdown(); server.server_close(); worker.join()
+
+
+if __name__ == '__main__': unittest.main()

@@ -1,0 +1,431 @@
+"""Opt-in transcript-only HTTP export. No source writes, logs, or credentials saved."""
+from contextlib import contextmanager
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import stat
+import threading
+import time
+import urllib.parse
+
+from archive import FLOORS
+
+PREFIX = "/api/transcript-export/v1/"
+CHUNK_BYTES = 16384
+PAGE_FILES = 8
+MAX_FILES = 50000
+MAX_FILE_BYTES = 256 * 1024 * 1024
+MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024 * 1024
+MAX_JSON_BYTES = 24 * 1024
+MAX_SESSIONS = 2
+IDLE_SECONDS = 1800
+SESSION_SECONDS = 86400
+OP_SECONDS = 15
+
+
+class ExportError(Exception):
+    def __init__(self, status, code):
+        self.status, self.code = status, code
+        super().__init__(code)
+
+
+def fail(status, code):
+    raise ExportError(status, code)
+
+
+def check_time(deadline):
+    if time.monotonic() >= deadline:
+        fail(503, "operation_timeout")
+
+
+def revision(st):
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def identity(st):
+    return (st.st_dev, st.st_ino)
+
+
+def regular(st):
+    # A hardlink could refer to a file outside the intended transcript tree.
+    return stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+
+
+def file_id(floor, name):
+    return hashlib.sha256(floor.encode("ascii") + b"\0" + os.fsencode(name)).hexdigest()
+
+
+def encode(payload):
+    data = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("ascii")
+    if len(data) > MAX_JSON_BYTES:
+        fail(503, "response_limit")
+    return data
+
+
+@contextmanager
+def directory(root, floor):
+    """Pin each absolute directory component; never follow a symlink."""
+    if floor not in FLOORS or not os.path.isabs(root):
+        fail(503, "unsafe_directory")
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+        fail(503, "secure_open_unavailable")
+    fds = []
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open("/", flags)
+        fds.append(fd)
+        for part in (*os.fspath(root).split("/")[1:], "transcripts", floor):
+            if not part or part in (".", ".."):
+                fail(503, "unsafe_directory")
+            fd = os.open(part, flags, dir_fd=fd)
+            fds.append(fd)
+        yield fd
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+class TranscriptAPI:
+    def __init__(self, archive, options):
+        self.root, self.options = archive.root, options
+        self.sessions = {}
+        self.lock = threading.BoundedSemaphore(1)
+        self.auth_revision = (options.get("transcript_export_enabled"), options.get("transcript_export_token_sha256"))
+        self.auth_lock = threading.Lock()
+
+    def authorized(self, headers):
+        digest = self.options.get("transcript_export_token_sha256", "")
+        if (self.options.get("transcript_export_enabled") is not True or
+                not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            return False
+        values = headers.get_all("Authorization", [])
+        if len(values) != 1:
+            return False
+        match = re.fullmatch(r"Bearer ([A-Za-z0-9_-]{43,128})", values[0])
+        return bool(match and hmac.compare_digest(hashlib.sha256(match[1].encode("ascii")).hexdigest(), digest))
+
+    @contextmanager
+    def opened(self, record):
+        floor, name = record["floor"], record["source_name"]
+        if (floor not in FLOORS or not name.endswith(".txt") or
+                not name or name in (".", "..") or "/" in name or "\x00" in name):
+            fail(409, "unsafe_entry")
+        fd = None
+        try:
+            with directory(self.root, floor) as parent:
+                try:
+                    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+                except FileNotFoundError:
+                    fail(410, "source_removed")
+                except OSError:
+                    fail(409, "source_unavailable")
+                before = os.fstat(fd)
+                if not regular(before):
+                    fail(409, "unsafe_entry")
+                if identity(before) != record["identity"]:
+                    fail(409, "source_replaced")
+                yield fd, before, parent
+        except ExportError:
+            raise
+        except OSError:
+            fail(409, "directory_unavailable")
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def check_link(self, parent, record, fd):
+        try:
+            current = os.stat(record["source_name"], dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            fail(410, "source_removed")
+        if not regular(current) or identity(current) != identity(os.fstat(fd)):
+            fail(409, "source_replaced")
+
+    def scan(self, deadline):
+        records = []
+        excluded = 0
+        for floor in FLOORS:
+            check_time(deadline)
+            with directory(self.root, floor) as parent, os.scandir(parent) as entries:
+                for entry in entries:
+                    check_time(deadline)
+                    if not entry.name.endswith(".txt"):
+                        excluded += 1
+                        if excluded > MAX_FILES:
+                            fail(413, "directory_entry_limit")
+                        continue
+                    if len(records) >= MAX_FILES:
+                        fail(413, "file_count_limit")
+                    item = {"id": file_id(floor, entry.name), "floor": floor,
+                            "source_name": entry.name, "status": "available", "snapshot": None}
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        item.update(identity=identity(st), inventory_revision=revision(st))
+                        if not regular(st):
+                            item["status"] = "unsafe_entry"
+                        elif st.st_size > MAX_FILE_BYTES:
+                            item["status"] = "file_size_limit"
+                    except FileNotFoundError:
+                        item["status"] = "source_removed"
+                    except OSError:
+                        item["status"] = "source_unavailable"
+                    records.append(item)
+        records.sort(key=lambda r: (r["floor"], os.fsencode(r["source_name"])))
+        if len({r["id"] for r in records}) != len(records):
+            fail(503, "identity_collision")
+        return records, excluded
+
+    def public_record(self, r):
+        result = {k: r[k] for k in ("id", "floor", "source_name", "status")}
+        result["source_name_b64"] = base64.b64encode(os.fsencode(r["source_name"])).decode("ascii")
+        if "inventory_revision" in r:
+            result.update(inventory_bytes=r["inventory_revision"][2], inventory_mtime_ns=r["inventory_revision"][3])
+        result["snapshot_ready"] = r["snapshot"] is not None
+        if r["snapshot"] is not None:
+            result.update(snapshot_bytes=r["snapshot"]["bytes"], sha256=r["snapshot"]["sha256"])
+        return result
+
+    def new_session(self, deadline):
+        if len(self.sessions) >= MAX_SESSIONS:
+            fail(429, "session_limit")
+        start = time.time_ns()
+        records, excluded = self.scan(deadline)
+        now = time.monotonic()
+        sid = secrets.token_urlsafe(24)
+        session = {"id": sid, "created": now, "used": now, "start_ns": start,
+                   "end_ns": time.time_ns(), "files": records, "by_id": {r["id"]: r for r in records},
+                   "excluded": excluded, "bytes": 0, "verified": set()}
+        # Publish only after every initially catalogued file has either a fixed
+        # digest/size or an explicit failure. No later moving per-file cutoff.
+        for record in records:
+            check_time(deadline)
+            if record["status"] != "available":
+                continue
+            try:
+                self.prepare(session, record, deadline)
+            except ExportError as error:
+                if error.status not in (409, 410):
+                    raise
+                record["status"] = error.code
+        session["end_ns"] = time.time_ns()
+        self.sessions[sid] = session
+        return session
+
+    def get_session(self, sid):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32}", sid):
+            fail(400, "invalid_snapshot")
+        session = self.sessions.get(sid)
+        if session is None:
+            fail(410, "snapshot_expired")
+        session["used"] = time.monotonic()
+        return session
+
+    def inventory_page(self, session, cursor, limit):
+        files = session["files"]
+        if cursor > len(files):
+            fail(416, "invalid_cursor")
+        end = min(cursor + limit, len(files))
+        return {"protocol_version": 1, "snapshot": session["id"], "inventory_complete": True,
+                "scan_started_unix_ns": session["start_ns"], "scan_finished_unix_ns": session["end_ns"],
+                "expected_files": len(files), "unavailable_files": sum(r["status"] != "available" for r in files),
+                "excluded_non_txt_entries": session["excluded"], "cursor": cursor,
+                "next_cursor": end if end < len(files) else None, "page_complete": end == len(files),
+                "chunk_bytes": CHUNK_BYTES, "files": [self.public_record(r) for r in files[cursor:end]],
+                "archive_is_atomic_snapshot": False, "complete": False}
+
+    def hash_prefix(self, fd, size, deadline):
+        digest, chunks, offset = hashlib.sha256(), [], 0
+        while offset < size:
+            check_time(deadline)
+            data = os.pread(fd, min(CHUNK_BYTES, size - offset), offset)
+            if len(data) != min(CHUNK_BYTES, size - offset):
+                fail(409, "source_truncated")
+            digest.update(data)
+            chunks.append(hashlib.sha256(data).digest())
+            offset += len(data)
+        return digest.hexdigest(), chunks
+
+    def prepare(self, session, record, deadline):
+        if record["status"] != "available":
+            fail(409, record["status"])
+        if record["snapshot"] is not None:
+            return record["snapshot"]
+        with self.opened(record) as (fd, before, parent):
+            if revision(before) != record["inventory_revision"]:
+                fail(409, "source_changed_since_inventory")
+            if before.st_size > MAX_FILE_BYTES:
+                fail(413, "file_size_limit")
+            if session["bytes"] + before.st_size > MAX_SNAPSHOT_BYTES:
+                fail(413, "snapshot_byte_limit")
+            sha, chunks = self.hash_prefix(fd, before.st_size, deadline)
+            after = os.fstat(fd)
+            if revision(before) != revision(after):
+                fail(409, "source_changed_during_snapshot")
+            self.check_link(parent, record, fd)
+            snapshot = {"bytes": before.st_size, "sha256": sha, "revision": revision(before),
+                        "chunks": chunks, "prepared_unix_ns": time.time_ns(),
+                        "changed_since_inventory": revision(before) != record["inventory_revision"]}
+        record["snapshot"] = snapshot
+        session["bytes"] += snapshot["bytes"]
+        return snapshot
+
+    def metadata(self, session, record, deadline):
+        snap = self.prepare(session, record, deadline)
+        return {"snapshot": session["id"], "file_id": record["id"], "snapshot_bytes": snap["bytes"],
+                "sha256": snap["sha256"], "snapshot_mtime_ns": snap["revision"][3],
+                "prepared_unix_ns": snap["prepared_unix_ns"],
+                "changed_since_inventory": snap["changed_since_inventory"],
+                "chunk_bytes": CHUNK_BYTES, "complete": False}
+
+    def chunk(self, session, record, offset, deadline):
+        snap = self.prepare(session, record, deadline)
+        size = snap["bytes"]
+        if offset % CHUNK_BYTES or offset > size or (offset == size and size != 0):
+            fail(416, "invalid_offset")
+        with self.opened(record) as (fd, before, parent):
+            if before.st_size < size:
+                fail(409, "source_truncated")
+            expected = min(CHUNK_BYTES, size - offset)
+            data = os.pread(fd, expected, offset)
+            sha = hashlib.sha256(data).digest()
+            if len(data) != expected or (expected and not hmac.compare_digest(sha, snap["chunks"][offset // CHUNK_BYTES])):
+                fail(409, "source_content_changed")
+            self.check_link(parent, record, fd)
+            after = os.fstat(fd)
+            if after.st_size < size:
+                fail(409, "source_truncated")
+            check_time(deadline)
+            return {"snapshot": session["id"], "file_id": record["id"], "offset": offset,
+                    "bytes": len(data), "next_offset": offset + len(data), "eof": offset + len(data) == size,
+                    "snapshot_bytes": size, "sha256": snap["sha256"], "chunk_sha256": sha.hex(),
+                    "data_base64": base64.b64encode(data).decode("ascii"),
+                    "source_metadata_changed": revision(after) != snap["revision"],
+                    "source_grew": after.st_size > size}
+
+    def verify(self, session, record, deadline):
+        snap = self.prepare(session, record, deadline)
+        with self.opened(record) as (fd, before, parent):
+            if before.st_size < snap["bytes"]:
+                fail(409, "source_truncated")
+            sha, _ = self.hash_prefix(fd, snap["bytes"], deadline)
+            if not hmac.compare_digest(sha, snap["sha256"]):
+                fail(409, "source_content_changed")
+            after = os.fstat(fd)
+            if revision(before) != revision(after):
+                fail(409, "source_changed_during_verification")
+            self.check_link(parent, record, fd)
+        session["verified"].add(record["id"])
+        return {"snapshot": session["id"], "file_id": record["id"], "snapshot_bytes": snap["bytes"],
+                "sha256": sha, "complete": True, "verified_unix_ns": time.time_ns(),
+                "source_grew": after.st_size > snap["bytes"],
+                "source_metadata_changed": revision(after) != snap["revision"]}
+
+    def summary(self, session, deadline):
+        current, excluded = self.scan(deadline)
+        old = session["by_id"]
+        new = {r["id"]: r for r in current}
+        changed = sum(r.get("inventory_revision") != new[key].get("inventory_revision")
+                      or r["status"] != new[key]["status"] for key, r in old.items() if key in new)
+        missing, added = len(old.keys() - new.keys()), len(new.keys() - old.keys())
+        verified = len(session["verified"])
+        return {"snapshot": session["id"], "expected_files": len(old), "verified_files": verified,
+                "snapshot_complete": verified == len(old),
+                "complete": verified == len(old) and not (added or missing or changed),
+                "inventory_complete": True,
+                "added_since_inventory": added, "removed_since_inventory": missing,
+                "changed_since_inventory": changed, "current_unavailable_files": sum(r["status"] != "available" for r in current),
+                "excluded_non_txt_entries": excluded, "current_matches_inventory": not (added or missing or changed),
+                "verification_scope": "each_file_at_its_own_verification_time",
+                "client_must_verify_received_bytes": True, "archive_is_atomic_snapshot": False}
+
+    def dispatch(self, path, query, deadline):
+        def params(allowed, required=()):
+            if set(query) - set(allowed) or set(required) - set(query):
+                fail(400, "invalid_parameters")
+        def number(key, default, maximum):
+            value = query.get(key, str(default))
+            if not re.fullmatch(r"0|[1-9][0-9]{0,9}", value) or int(value) > maximum:
+                fail(400, "invalid_" + key)
+            return int(value)
+        if path == "inventory":
+            params(("snapshot", "cursor", "limit"))
+            cursor, limit = number("cursor", 0, MAX_FILES), number("limit", PAGE_FILES, PAGE_FILES)
+            if limit == 0 or ("snapshot" not in query and cursor):
+                fail(400, "invalid_pagination")
+            session = self.get_session(query["snapshot"]) if "snapshot" in query else self.new_session(deadline)
+            return self.inventory_page(session, cursor, limit)
+        if path in ("summary", "release"):
+            params(("snapshot",), ("snapshot",))
+            session = self.get_session(query["snapshot"])
+            if path == "release":
+                del self.sessions[session["id"]]
+                return {"released": True}
+            return self.summary(session, deadline)
+        if path in ("file", "chunk", "verify"):
+            params(("snapshot", "file_id", "offset") if path == "chunk" else ("snapshot", "file_id"), ("snapshot", "file_id"))
+            session = self.get_session(query["snapshot"])
+            record = session["by_id"].get(query["file_id"])
+            if record is None:
+                fail(404, "unknown_file")
+            if path == "file":
+                return self.metadata(session, record, deadline)
+            if path == "verify":
+                return self.verify(session, record, deadline)
+            return self.chunk(session, record, number("offset", 0, MAX_FILE_BYTES), deadline)
+        fail(404, "unknown_export_route")
+
+    def handle(self, handler):
+        """Handle only the reserved prefix, with no ingress authorization bypass."""
+        # Configuration is normally immutable until an app restart. Also make
+        # in-process disable/rotation invalidate sessions before any response.
+        with self.auth_lock:
+            auth_revision = (self.options.get("transcript_export_enabled"), self.options.get("transcript_export_token_sha256"))
+            if auth_revision != self.auth_revision:
+                self.sessions.clear()
+                self.auth_revision = auth_revision
+        if not self.authorized(handler.headers):
+            handler.send(401, {"error": "transcript_export_unauthorized"})
+            return
+        if handler.command != "GET":
+            handler.send(405, {"error": "read_only_export"})
+            return
+        if not self.lock.acquire(blocking=False):
+            handler.send(429, {"error": "export_busy"})
+            return
+        try:
+            now = time.monotonic()
+            self.sessions = {k: s for k, s in self.sessions.items()
+                             if now - s["used"] < IDLE_SECONDS and now - s["created"] < SESSION_SECONDS}
+            parsed = urllib.parse.urlsplit(handler.path)
+            if len(handler.path) > 2048 or parsed.fragment or parsed.scheme or parsed.netloc:
+                fail(400, "invalid_request_target")
+            pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True, max_num_fields=6)
+            query = dict(pairs)
+            if len(query) != len(pairs):
+                fail(400, "duplicate_parameter")
+            result = self.dispatch(parsed.path[len(PREFIX):], query, now + OP_SECONDS)
+            response = (200, encode(result))
+        except ExportError as error:
+            response = (error.status, {"error": error.code, "complete": False})
+        except ValueError:
+            response = (400, {"error": "invalid_request", "complete": False})
+        except Exception:
+            response = (503, {"error": "export_unavailable", "complete": False})
+        finally:
+            # A client may receive Content-Length bytes and send the next request
+            # before send() returns. Release only the computation slot here, after
+            # immutable response construction; slow sockets remain HTTP-bounded.
+            self.lock.release()
+        # Do not emit bytes for an in-flight request revoked during work.
+        if auth_revision != (self.options.get("transcript_export_enabled"), self.options.get("transcript_export_token_sha256")):
+            with self.auth_lock:
+                self.sessions.clear()
+            response = (401, {"error": "transcript_export_unauthorized", "complete": False})
+        try:
+            handler.send(*response)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            handler.close_connection = True

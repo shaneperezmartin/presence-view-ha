@@ -1,0 +1,70 @@
+"""Offline, bounded CPU worker. No microphone, saved raw audio, or credentials."""
+import contextlib
+import json
+import logging
+import os
+from pathlib import Path
+import resource
+import signal
+import sys
+import time
+import warnings
+
+
+def main():
+    os.umask(0o077)
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_AS, (6 * 1024**3, 6 * 1024**3))
+    os.nice(10)
+    signal.alarm(235)
+    logging.disable(logging.CRITICAL)
+    warnings.filterwarnings('ignore')
+    started = time.monotonic()
+    stage = 'integrity'
+    result = {'success': False, 'stage': stage}
+    try:
+        # Python network clients fail closed in addition to library offline flags.
+        def private_audit(event, args):
+            if event in ('socket.connect', 'socket.getaddrinfo', 'socket.sendto'):
+                raise PermissionError('Offline worker')
+        sys.addaudithook(private_audit)
+        from model_setup import FILES, verify_file
+        model = Path(sys.argv[1])
+        if model.is_symlink(): raise ValueError('integrity')
+        for name, spec in FILES.items():
+            path = model / name
+            if path.parent.is_symlink(): raise ValueError('integrity')
+            verify_file(path, spec)
+        pcm = sys.stdin.buffer.read(19_200_001)
+        if not 0 < len(pcm) <= 19_200_000 or len(pcm) % 2: raise ValueError('integrity')
+        stage = 'load'
+        with open(os.devnull, 'w') as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+            import torch
+            from pyannote.audio import Pipeline
+            torch.set_num_threads(2)
+            torch.set_num_interop_threads(1)
+            pipeline = Pipeline.from_pretrained(str(model), token=False)
+            if pipeline is None: raise RuntimeError('load')
+            pipeline.to(torch.device('cpu'))
+            waveform = torch.frombuffer(bytearray(pcm), dtype=torch.int16).to(torch.float32).reshape(1, -1) / 32768.
+            pcm = None
+            stage = 'inference'
+            with torch.inference_mode():
+                output = pipeline({'waveform': waveform, 'sample_rate': 16000})
+            labels = {}
+            turns = []
+            for segment, _, label in output.exclusive_speaker_diarization.itertracks(yield_label=True):
+                if label not in labels: labels[label] = len(labels) + 1
+                turns.append([round(max(0., segment.start), 3), round(min(waveform.shape[1]/16000, segment.end), 3), labels[label]])
+            result = {'success': True, 'turns': turns,
+                      'seconds': round(time.monotonic() - started, 2),
+                      'peak_rss_mb': round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)}
+    except MemoryError:
+        result = {'success': False, 'stage': 'memory'}
+    except Exception:
+        result = {'success': False, 'stage': stage}
+    print(json.dumps(result), flush=True)
+    return 0 if result['success'] else 1
+
+
+if __name__ == '__main__': sys.exit(main())

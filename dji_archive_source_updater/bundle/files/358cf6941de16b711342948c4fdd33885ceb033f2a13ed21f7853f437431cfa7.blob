@@ -1,0 +1,152 @@
+"""Generated fixtures only: no microphone, model download, or real words."""
+import asyncio
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import AsyncMock, patch
+from archive import Controller, stamp, FRAME_BYTES
+from test_archive import OPTIONS
+from diarization import MAX_PCM, checked_turns, labeled_text, private_environment
+
+
+class LabelsTests(unittest.TestCase):
+    def test_single_mixed_and_uncertain_passages(self):
+        epoch = 1760000000
+        original = '\n'.join(f'[{stamp(epoch+a)} - {stamp(epoch+b)}] synthetic passage'
+                              for a,b in ((0,1),(0,3),(5,6)))
+        result = labeled_text(original, [(0,1,1),(1,3,2)], epoch)
+        self.assertIn('Speaker 1: synthetic passage', result)
+        self.assertIn('Mixed speakers 1, 2: synthetic passage', result)
+        self.assertIn('Speaker uncertain: synthetic passage', result)
+        self.assertIn('0.00-1.00: Speaker 1', result)
+        self.assertIn('within this floor/file', result)
+
+    def test_missing_intervals_and_headers_preserved(self):
+        original = 'Header\n[2026-01-01T00:00:00+00:00 - 2026-01-01T00:00:01+00:00] [Skipped: queue full]\n'
+        self.assertTrue(labeled_text(original, [], 0).startswith(original))
+
+    def test_worker_result_validation(self):
+        self.assertEqual(checked_turns([[0,1,1]], 1), [(0.,1.,1)])
+        for value in ([[0,100,1]], [[float('nan'),1,1]], [[0,1,'person']], [[1,0,1]], [[0,1,0]], [[0,1,True]]):
+            with self.assertRaises(ValueError): checked_turns(value, 2)
+
+    def test_worker_has_no_credentials_and_offline_flags(self):
+        with patch.dict(os.environ, {'SUPERVISOR_TOKEN':'synthetic', 'HF_TOKEN':'synthetic'}):
+            env = private_environment()
+        self.assertNotIn('HF_TOKEN', env)
+        self.assertNotIn('SUPERVISOR_TOKEN', env)
+        self.assertEqual(env['HF_HUB_OFFLINE'], '1')
+        self.assertEqual(env['PYANNOTE_METRICS_ENABLED'], '0')
+        self.assertEqual(env['OMP_NUM_THREADS'], '2')
+
+
+class FlowTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.c = Controller(self.temp.name, OPTIONS)
+        self.d = self.c.diarizer
+        self.d.model.mkdir(parents=True)
+        (self.d.model / 'config.yaml').write_text('synthetic fixture, never loaded')
+
+    def test_buffer_ends_in_separate_floor_jobs(self):
+        a, b = b'\1\0' * 320, b'\2\0' * 320
+        self.c.feed_text((a,b), 1760000000)
+        paths = self.c.text_paths.copy()
+        self.c.close_text(1760000000.02)
+        self.assertEqual(self.d.queue.qsize(),2)
+        jobs = [self.d.queue.get_nowait(), self.d.queue.get_nowait()]
+        self.assertEqual([j[0] for j in jobs], paths)
+        self.assertEqual([j[1] for j in jobs], [a,b])
+        self.assertEqual([len(v) for v in self.d.buffers], [0,0])
+        self.assertEqual([self.c.archive.active[p] for p in paths], [1,1])
+        self.assertEqual(self.c.archive.files('audio'), [])
+
+    def test_queue_overflow_preserves_text_and_discards_audio_buffer(self):
+        for n in range(2):
+            self.c.feed_text((b'\0'*FRAME_BYTES, b'\0'*FRAME_BYTES), 1760000000+n)
+            self.c.close_text(1760000000+n+.02)
+        self.assertEqual(self.d.queue.qsize(), 2)
+        self.assertEqual(self.d.failed, 2)
+        self.assertEqual(sum(map(len,self.d.buffers)), 0)
+        self.assertEqual(self.c.archive.files('audio'), [])
+
+    async def test_completion_preserves_words_and_releases_file(self):
+        epoch = 1760000000
+        path = self.c.archive.new('transcripts','upstairs',epoch,'.txt')
+        self.c.archive.append(path, f'[{stamp(epoch)} - {stamp(epoch+1)}] synthetic fixture\n')
+        self.c.archive.active[path] = 1
+        self.d.queue.put_nowait((path, b'\0'*32000, epoch))
+        fake = {'turns': [(0,1,1)], 'seconds': .2, 'peak_rss_mb': 1}
+        with patch('diarization.infer', new=AsyncMock(return_value=fake)):
+            loop = asyncio.create_task(self.d.loop())
+            await asyncio.wait_for(self.d.queue.join(), 2)
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+        self.assertIn('Speaker 1: synthetic fixture',path.read_text())
+        self.assertEqual(self.c.archive.active[path], 0)
+        self.assertEqual(self.d.completed, 1)
+        self.assertFalse(path.with_name(path.stem + '.labeling.txt').exists())
+
+    def test_interrupted_rewrite_file_is_covered_by_retention(self):
+        path = self.c.archive.root / 'transcripts' / 'upstairs' / 'synthetic.labeling.txt'
+        path.write_text('partial synthetic fixture')
+        os.utime(path, (1,1))
+        self.c.archive.cleanup(now=31*86400)
+        self.assertFalse(path.exists())
+
+    async def test_failure_keeps_plain_text_and_releases_file(self):
+        epoch = 1760000000
+        path = self.c.archive.new('transcripts','downstairs',epoch,'.txt')
+        original = f'[{stamp(epoch)} - {stamp(epoch+1)}] synthetic fixture\n'
+        self.c.archive.append(path, original)
+        self.c.archive.active[path] = 1
+        self.d.queue.put_nowait((path, b'\0'*32000, epoch))
+        with patch('diarization.infer', new=AsyncMock(side_effect=RuntimeError('private-exception-text'))):
+            loop = asyncio.create_task(self.d.loop())
+            await asyncio.wait_for(self.d.queue.join(), 2)
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+        self.assertTrue(path.read_text().startswith(original))
+        self.assertIn('Speaker labels unavailable',path.read_text())
+        self.assertNotIn('private-exception-text', json.dumps(self.d.status()))
+        self.assertEqual(self.c.archive.active[path], 0)
+
+    async def test_waits_for_pending_whisper_before_rewrite(self):
+        epoch = 1760000000
+        path = self.c.archive.new('transcripts','upstairs',epoch,'.txt')
+        self.c.archive.append(path,'Header\n')
+        self.c.archive.active[path] = 2
+        async def finish_whisper():
+            await asyncio.sleep(.02)
+            self.c.archive.append(path,f'[{stamp(epoch)} - {stamp(epoch+1)}] final fixture\n')
+            self.c.archive.active[path] -= 1
+        with patch('diarization.infer', new=AsyncMock(return_value={'turns':[(0,1,1)],'seconds':1,'peak_rss_mb':1})):
+            await asyncio.gather(self.d.process(path,b'\0'*32000,epoch), finish_whisper())
+        self.assertIn('Speaker 1: final fixture',path.read_text())
+
+    async def test_silence_does_not_launch_model(self):
+        path = self.c.archive.new('transcripts','upstairs',1760000000,'.txt')
+        self.c.archive.append(path,'Header with no recognized speech\n')
+        self.c.archive.active[path] = 1
+        with patch('diarization.infer', new=AsyncMock()) as run:
+            await self.d.process(path,b'\0'*32000,1760000000)
+            run.assert_not_called()
+
+    async def test_synthetic_test_blocks_capture_until_finished(self):
+        self.d.test_task = asyncio.create_task(asyncio.sleep(10))
+        with self.assertRaises(RuntimeError): await self.c.set_control('recording', True)
+        self.assertFalse(self.c.state.value['recording'])
+        self.d.test_task.cancel()
+        await asyncio.gather(self.d.test_task, return_exceptions=True)
+
+    def test_model_missing_does_not_buffer(self):
+        (self.d.model / 'config.yaml').unlink()
+        self.d.feed((b'\0'*640,b'\0'*640),0)
+        self.assertEqual(sum(map(len,self.d.buffers)), 0)
+
+
+if __name__ == '__main__': unittest.main()

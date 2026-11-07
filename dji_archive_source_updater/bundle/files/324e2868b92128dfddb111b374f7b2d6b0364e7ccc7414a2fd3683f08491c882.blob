@@ -1,0 +1,62 @@
+"""Synthetic end-to-end client probe. Temporary loopback server, no HA or capture."""
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import threading
+import urllib.request
+
+from archive import Archive
+from server import Handler, BoundedHTTPServer
+from transcript_api import TranscriptAPI, MAX_JSON_BYTES
+from transcript_client import retrieve
+
+
+def main():
+    # Public test-only placeholder, deliberately not a real credential.
+    token = "SYNTHETIC_PROBE_TOKEN_NEVER_USE_FOR_PRIVATE_DATA_00000000"
+    with tempfile.TemporaryDirectory() as root:
+        archive = Archive(Path(root) / "archive")
+        originals = {}
+        for floor in ("upstairs", "downstairs"):
+            for index in range(11):
+                name = f"same-{index:02d}.txt"
+                raw = b"" if index == 0 else (b"Synthetic byte fixture\r\n\xff\x00" * (index * 128))
+                (archive.root / "transcripts" / floor / name).write_bytes(raw)
+                originals[(floor, name)] = raw
+        class ProxyOnlyHandler(Handler):
+            def permitted(self): return False
+        server = BoundedHTTPServer(("127.0.0.1", 0), ProxyOnlyHandler)
+        server.transcript_api = TranscriptAPI(archive, {"transcript_export_enabled": True,
+            "transcript_export_token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest()})
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        responses, max_proxy_bytes, received = 0, 0, {}
+        def request_json(path):
+            nonlocal responses, max_proxy_bytes
+            request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}" + path,
+                headers={"Authorization": "Bearer " + token})
+            with opener.open(request, timeout=30) as response:
+                raw = response.read(MAX_JSON_BYTES + 1)
+                assert len(raw) <= MAX_JSON_BYTES
+                # Conservative escaped-text proxy wrapper, not just JSON body.
+                proxy_size = len(json.dumps({"response": raw.decode("ascii")}).encode("ascii"))
+                assert proxy_size < 50 * 1024
+                max_proxy_bytes = max(max_proxy_bytes, proxy_size)
+                responses += 1
+                return json.loads(raw)
+        def receive(record, metadata, chunks):
+            received[(record["floor"], record["source_name"])] = b"".join(chunks)
+        try:
+            summary = retrieve(request_json, receive)
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
+        assert received == originals and summary["complete"] and summary["snapshot_complete"]
+        print(json.dumps({"synthetic_only": True, "files": len(received),
+            "raw_bytes": sum(map(len, received.values())), "responses": responses,
+            "largest_escaped_proxy_response_bytes": max_proxy_bytes,
+            "all_bytes_and_digests_verified": True, "source_writes_by_export": False}))
+
+
+if __name__ == "__main__": main()

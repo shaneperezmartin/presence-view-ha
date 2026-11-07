@@ -1,0 +1,458 @@
+"""Synthetic fixtures only. Never opens microphones or contacts HA/services."""
+from contextlib import contextmanager
+from email.message import Message
+import base64
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import socket
+import tempfile
+import threading
+import time
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+import urllib.error
+import urllib.request
+
+from archive import Archive
+from server import Handler, BoundedHTTPServer
+import transcript_api as api
+from transcript_client import retrieve
+
+# Obviously fabricated, public test token, never a production credential.
+TOKEN = "SYNTHETIC_TEST_TOKEN_DO_NOT_USE_IN_PRODUCTION_00000000"
+DIGEST = hashlib.sha256(TOKEN.encode()).hexdigest()
+
+
+class APITests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.archive = Archive(Path(self.temp.name) / "archive")
+        self.options = {"transcript_export_enabled": True, "transcript_export_token_sha256": DIGEST}
+        self.api = api.TranscriptAPI(self.archive, self.options)
+        self.deadline = time.monotonic() + 60
+
+    def put(self, name="fixture.txt", data=b"Synthetic words\r\n\xff\x00", floor="upstairs"):
+        path = self.archive.root / "transcripts" / floor / name
+        path.write_bytes(data)
+        return path
+
+    def call(self, route, **query):
+        return self.api.dispatch(route, {k: str(v) for k, v in query.items()}, self.deadline)
+
+    def start(self, **kwargs):
+        page = self.call("inventory", **kwargs)
+        return page, page["snapshot"]
+
+    def first(self):
+        page, sid = self.start()
+        fid = page["files"][0]["id"]
+        self.call("file", snapshot=sid, file_id=fid)
+        return sid, fid
+
+    def assert_error(self, status, code, fn, *args, **kwargs):
+        with self.assertRaises(api.ExportError) as caught:
+            fn(*args, **kwargs)
+        self.assertEqual((caught.exception.status, caught.exception.code), (status, code))
+
+    def test_runtime_versions_match_and_export_settings_never_in_status(self):
+        from archive import Controller
+        from server import DEVICE
+        from test_archive import OPTIONS
+        controller = Controller(self.temp.name, {**OPTIONS, **self.options})
+        status = controller.status()
+        self.assertEqual(status["version"], "0.2.4")
+        self.assertEqual(DEVICE["sw_version"], status["version"])
+        self.assertNotIn("transcript_export_token_sha256", status)
+        self.assertNotIn("transcript_export_enabled", status)
+        self.assertNotIn(DIGEST, json.dumps(status))
+
+    def test_default_disabled_and_strict_auth(self):
+        headers = Message(); headers["Authorization"] = "Bearer " + TOKEN
+        self.assertTrue(self.api.authorized(headers))
+        for options in ({}, {"transcript_export_enabled": "true", "transcript_export_token_sha256": DIGEST},
+                        {"transcript_export_enabled": True, "transcript_export_token_sha256": "bad"}):
+            self.assertFalse(api.TranscriptAPI(self.archive, options).authorized(headers))
+        for value in ("Bearer short", "Basic " + TOKEN, "Bearer " + TOKEN + "!", "Bearer " + "X" * 129):
+            wrong = Message(); wrong["Authorization"] = value
+            self.assertFalse(self.api.authorized(wrong))
+        headers["Authorization"] = "Bearer " + TOKEN
+        self.assertFalse(self.api.authorized(headers))
+
+    def test_empty_complete_inventory_and_summary(self):
+        page, sid = self.start()
+        self.assertEqual(page["expected_files"], 0)
+        self.assertTrue(page["page_complete"])
+        self.assertTrue(self.call("summary", snapshot=sid)["complete"])
+
+    def test_complete_243_files_paginated_duplicate_safe_names(self):
+        for floor in ("upstairs", "downstairs"):
+            for i in range(121):
+                self.put(f"{i}.txt", floor=floor)
+        self.put("zero.txt", b"")
+        page, sid = self.start()
+        ids = []
+        while True:
+            self.assertLess(len(api.encode(page)), api.MAX_JSON_BYTES)
+            ids += [r["id"] for r in page["files"]]
+            if page["next_cursor"] is None: break
+            page = self.call("inventory", snapshot=sid, cursor=page["next_cursor"])
+        self.assertEqual(len(ids), 243)
+        self.assertEqual(len(set(ids)), 243)
+        self.assertFalse(self.call("summary", snapshot=sid)["complete"])
+
+    def test_exact_binary_large_and_empty_via_reference_client(self):
+        originals = {}
+        for name, content, floor in (("both.txt", bytes(range(256)) * 257, "upstairs"),
+                ("both.txt", b"", "downstairs"), ("weird\\name.txt", b"\xff\r\n\x00", "upstairs")):
+            self.put(name, content, floor)
+            originals[(floor, name)] = content
+        received = {}
+        def transport(path):
+            parsed = urllib.parse.urlsplit(path)
+            return self.call(parsed.path[len(api.PREFIX):], **dict(urllib.parse.parse_qsl(parsed.query)))
+        def receive(record, metadata, chunks):
+            received[(record["floor"], record["source_name"])] = b"".join(chunks)
+        summary = retrieve(transport, receive)
+        self.assertTrue(summary["complete"])
+        self.assertEqual(received, originals)
+        self.assertFalse(self.api.sessions)
+
+    def test_append_after_snapshot_exact_fixed_prefix(self):
+        path = self.put(data=b"before")
+        sid, fid = self.first()
+        with path.open("ab") as stream: stream.write(b" appended")
+        result = self.call("chunk", snapshot=sid, file_id=fid)
+        self.assertEqual(base64.b64decode(result["data_base64"]), b"before")
+        self.assertTrue(result["source_grew"])
+        final = self.call("verify", snapshot=sid, file_id=fid)
+        self.assertTrue(final["complete"])
+        self.assertTrue(final["source_grew"])
+        self.assertFalse(self.call("summary", snapshot=sid)["current_matches_inventory"])
+
+    def test_inplace_same_size_rewrite_detected(self):
+        path = self.put(data=b"first")
+        sid, fid = self.first()
+        path.write_bytes(b"other")
+        for route in ("chunk", "verify"):
+            self.assert_error(409, "source_content_changed", self.call, route, snapshot=sid, file_id=fid)
+
+    def test_rewrite_other_chunk_detected_on_final_verify(self):
+        path = self.put(data=b"a" * (api.CHUNK_BYTES * 2))
+        sid, fid = self.first()
+        with path.open("r+b") as stream:
+            stream.seek(api.CHUNK_BYTES); stream.write(b"x")
+        self.call("chunk", snapshot=sid, file_id=fid)
+        self.assert_error(409, "source_content_changed", self.call, "verify", snapshot=sid, file_id=fid)
+
+    def test_truncate_remove_atomic_replacement_detected(self):
+        for action, code, status in (("truncate", "source_truncated", 409), ("remove", "source_removed", 410),
+                                      ("replace", "source_replaced", 409)):
+            self.api.sessions.clear()
+            path = self.put(data=b"original")
+            sid, fid = self.first()
+            if action == "truncate": path.write_bytes(b"x")
+            elif action == "remove": path.unlink()
+            else:
+                replacement = path.with_suffix(".new"); replacement.write_bytes(b"original"); replacement.replace(path)
+            self.assert_error(status, code, self.call, "chunk", snapshot=sid, file_id=fid)
+
+    def test_mutation_during_prepare_fails_and_does_not_cache(self):
+        path = self.put(data=b"before")
+        real_hash = self.api.hash_prefix
+        def raced(fd, size, deadline):
+            result = real_hash(fd, size, deadline)
+            path.write_bytes(b"after!")
+            return result
+        with patch.object(self.api, "hash_prefix", raced):
+            page, sid = self.start()
+        fid = page["files"][0]["id"]
+        self.assertEqual(page["unavailable_files"], 1)
+        self.assertEqual(page["files"][0]["status"], "source_changed_during_snapshot")
+        self.assertIsNone(self.api.sessions[sid]["by_id"][fid]["snapshot"])
+
+    def test_symlink_fifo_directory_hardlink_listed_not_silently_skipped(self):
+        folder = self.archive.root / "transcripts" / "upstairs"
+        outside = Path(self.temp.name) / "outside"; outside.write_bytes(b"private")
+        (folder / "symlink.txt").symlink_to(outside)
+        (folder / "folder.txt").mkdir()
+        os.mkfifo(folder / "fifo.txt")
+        os.link(outside, folder / "hardlink.txt")
+        (folder / "audio.aac").write_bytes(b"not a transcript")
+        page, sid = self.start()
+        self.assertEqual(page["expected_files"], 4)
+        self.assertEqual(page["unavailable_files"], 4)
+        self.assertEqual(page["excluded_non_txt_entries"], 1)
+        for record in page["files"]:
+            self.assert_error(409, "unsafe_entry", self.call, "file", snapshot=sid, file_id=record["id"])
+
+    def test_directory_symlink_swap_cannot_export_outside(self):
+        path = self.put()
+        sid, fid = self.first()
+        folder = path.parent; folder.rename(folder.with_name("old"))
+        outside = Path(self.temp.name) / "outside"; outside.mkdir(); (outside / path.name).write_bytes(b"secret")
+        folder.symlink_to(outside, target_is_directory=True)
+        self.assert_error(409, "directory_unavailable", self.call, "chunk", snapshot=sid, file_id=fid)
+
+    def test_all_ancestor_symlinks_rejected(self):
+        self.put()
+        alias = Path(self.temp.name) / "alias"; alias.symlink_to(self.archive.root, target_is_directory=True)
+        self.api.root = alias
+        with self.assertRaises(OSError): self.start()
+
+    def test_page_and_offset_validation(self):
+        self.put(data=b"content")
+        sid, fid = self.first()
+        for query in ({"limit": 0}, {"limit": 9}, {"cursor": -1}, {"cursor": "01"}, {"cursor": 1}, {"path": "../../etc/passwd"}):
+            with self.assertRaises(api.ExportError): self.call("inventory", **query)
+        for offset in (1, -1, 7, 16384, "1.0", "00", "999999999999999999"):
+            with self.assertRaises(api.ExportError): self.call("chunk", snapshot=sid, file_id=fid, offset=offset)
+        self.assert_error(404, "unknown_file", self.call, "file", snapshot=sid, file_id="../../options.json")
+
+    def test_limits_and_timeout_explicit(self):
+        self.put(data=b"abc")
+        with patch.object(api, "MAX_FILES", 0):
+            self.assert_error(413, "file_count_limit", self.start)
+        with patch.object(api, "MAX_FILE_BYTES", 1):
+            page, _ = self.start(); self.assertEqual(page["unavailable_files"], 1)
+        self.api.sessions.clear()
+        with patch.object(api, "MAX_SNAPSHOT_BYTES", 1):
+            self.assert_error(413, "snapshot_byte_limit", self.start)
+        self.deadline = 0
+        self.assert_error(503, "operation_timeout", self.start)
+
+    def test_resource_bounds_and_release(self):
+        _, one = self.start(); _, two = self.start()
+        self.assert_error(429, "session_limit", self.start)
+        self.call("release", snapshot=one)
+        self.assert_error(410, "snapshot_expired", self.call, "summary", snapshot=one)
+        self.start()
+
+    def test_response_bound_worst_escaped_names(self):
+        for i in range(8):
+            name = os.fsdecode(bytes([0xff]) * 245 + str(i).encode() + b".txt")
+            self.put(name, b"a" * api.CHUNK_BYTES)
+        page, sid = self.start()
+        for result in (page, self.call("chunk", snapshot=sid, file_id=page["files"][0]["id"])):
+            raw = api.encode(result)
+            self.assertLess(len(raw), api.MAX_JSON_BYTES)
+            self.assertLess(len(json.dumps({"response": raw.decode()}).encode()), 50 * 1024)
+        with patch.object(api, "MAX_JSON_BYTES", 1):
+            self.assert_error(503, "response_limit", api.encode, page)
+
+    def test_summary_reports_added_removed_changed(self):
+        a = self.put("a.txt"); b = self.put("b.txt")
+        _, sid = self.start()
+        a.unlink(); b.write_bytes(b"changed"); self.put("new.txt")
+        result = self.call("summary", snapshot=sid)
+        self.assertEqual((result["added_since_inventory"], result["removed_since_inventory"], result["changed_since_inventory"]), (1, 1, 1))
+        self.assertFalse(result["complete"])
+
+    def test_change_after_catalog_before_hash_is_explicit_unavailable(self):
+        path = self.put(data=b"first")
+        scan = self.api.scan
+        for data in (b"other", b"other plus growth"):
+            self.api.sessions.clear()
+            path.write_bytes(b"first")
+            def changed(deadline):
+                records = scan(deadline)
+                path.write_bytes(data)
+                return records
+            with patch.object(self.api, "scan", changed):
+                page, sid = self.start()
+            self.assertEqual(page["unavailable_files"], 1)
+            self.assertEqual(page["files"][0]["status"], "source_changed_since_inventory")
+            self.assertFalse(self.call("summary", snapshot=sid)["complete"])
+
+    def test_summary_never_claims_current_complete_after_retention(self):
+        path = self.put()
+        sid, fid = self.first()
+        self.call("verify", snapshot=sid, file_id=fid)
+        path.unlink()
+        summary = self.call("summary", snapshot=sid)
+        self.assertTrue(summary["snapshot_complete"])
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["removed_since_inventory"], 1)
+
+    def test_inventory_already_captures_every_file_digest(self):
+        path = self.put(data=b"first")
+        page, sid = self.start()
+        record = page["files"][0]
+        self.assertTrue(record["snapshot_ready"])
+        self.assertEqual(record["sha256"], hashlib.sha256(b"first").hexdigest())
+        path.write_bytes(b"other plus growth")
+        metadata = self.call("file", snapshot=sid, file_id=record["id"])
+        self.assertEqual(metadata["snapshot_bytes"], 5)
+        self.assertEqual(metadata["sha256"], record["sha256"])
+        self.assert_error(409, "source_content_changed", self.call, "chunk", snapshot=sid, file_id=record["id"])
+
+    def test_all_exports_leave_source_controls_and_counters_unchanged(self):
+        path = self.put()
+        self.archive.active[path] = 2
+        state = Path(self.temp.name) / "state.json"
+        state.write_text('{"recording":true,"transcription":true}')
+        before = {str(p.relative_to(self.temp.name)): p.read_bytes() for p in Path(self.temp.name).rglob("*") if p.is_file()}
+        mtime = path.stat().st_mtime_ns
+        sid, fid = self.first()
+        self.call("chunk", snapshot=sid, file_id=fid)
+        self.call("verify", snapshot=sid, file_id=fid)
+        self.call("release", snapshot=sid)
+        after = {str(p.relative_to(self.temp.name)): p.read_bytes() for p in Path(self.temp.name).rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+        self.assertEqual(path.stat().st_mtime_ns, mtime)
+        self.assertEqual(self.archive.active[path], 2)
+
+    @contextmanager
+    def http(self, permitted=False):
+        class TestHandler(Handler):
+            def permitted(inner): return permitted
+        server = BoundedHTTPServer(("127.0.0.1", 0), TestHandler)
+        server.transcript_api = self.api
+        server.controller = SimpleNamespace(archive=self.archive)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try: yield f"http://127.0.0.1:{server.server_port}", opener, server
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
+
+    def request(self, opener, base, route="inventory", token=TOKEN, method="GET", extra=None):
+        headers = {"Authorization": "Bearer " + token} if token else {}
+        headers.update(extra or {})
+        request = urllib.request.Request(base + api.PREFIX + route, headers=headers, method=method)
+        with opener.open(request, timeout=5) as response:
+            raw = response.read()
+            self.assertLess(len(raw), api.MAX_JSON_BYTES)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            return json.loads(raw)
+
+    def test_http_token_only_never_grants_control_or_legacy_ingress(self):
+        self.put()
+        with self.http() as (base, opener, _):
+            page = self.request(opener, base)
+            self.assertEqual(page["expected_files"], 1)
+            for route in ("/api/status", "/api/files?kind=transcripts", "/download-transcripts.zip", "/api/control", "/api/model-setup"):
+                request = urllib.request.Request(base + route, headers={"Authorization": "Bearer " + TOKEN})
+                with self.assertRaises(urllib.error.HTTPError) as error: opener.open(request)
+                self.assertEqual(error.exception.code, 403); error.exception.close()
+            with self.assertRaises(urllib.error.HTTPError) as error: self.request(opener, base, method="POST")
+            self.assertEqual(error.exception.code, 405); error.exception.close()
+
+    def test_http_auth_not_bypassed_by_ingress_ip_or_spoofed_headers(self):
+        with self.http(permitted=True) as (base, opener, _):
+            for extra in ({}, {"X-Forwarded-For": "172.30.32.2", "X-Ingress-Path": "/api/hassio_ingress/fake"}):
+                with self.assertRaises(urllib.error.HTTPError) as error: self.request(opener, base, token=None, extra=extra)
+                self.assertEqual(error.exception.code, 401); error.exception.close()
+
+    def test_http_revocation_rotation_clear_sessions_and_expiry(self):
+        with self.http() as (base, opener, _):
+            page = self.request(opener, base)
+            self.options["transcript_export_enabled"] = False
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request(opener, base, "summary?snapshot=" + page["snapshot"])
+            self.assertEqual(error.exception.code, 401); error.exception.close()
+            self.options["transcript_export_enabled"] = True
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request(opener, base, "summary?snapshot=" + page["snapshot"])
+            self.assertEqual(error.exception.code, 410); error.exception.close()
+            new = TOKEN + "NEW"; self.options["transcript_export_token_sha256"] = hashlib.sha256(new.encode()).hexdigest()
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request(opener, base, "summary?snapshot=" + page["snapshot"], token=new)
+            self.assertEqual(error.exception.code, 410); error.exception.close()
+            page = self.request(opener, base, token=new)
+            self.api.sessions[page["snapshot"]]["used"] -= api.IDLE_SECONDS + 1
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request(opener, base, "summary?snapshot=" + page["snapshot"], token=new)
+            self.assertEqual(error.exception.code, 410); error.exception.close()
+
+    def test_http_duplicate_query_rejected_and_busy_slot_recovers(self):
+        with self.http() as (base, opener, _):
+            for route in ("inventory?limit=1&limit=2", "inventory?token=" + TOKEN, "inventory?limit", "audio", "inventory?cursor=" + "1" * 2100):
+                with self.assertRaises(urllib.error.HTTPError) as error: self.request(opener, base, route)
+                self.assertIn(error.exception.code, (400, 404)); error.exception.close()
+            with self.api.lock:
+                with self.assertRaises(urllib.error.HTTPError) as error: self.request(opener, base)
+                self.assertEqual(error.exception.code, 429); error.exception.close()
+            self.request(opener, base)
+
+    def test_next_request_after_response_bytes_does_not_hit_busy_lock(self):
+        self.put()
+        headers = Message(); headers["Authorization"] = "Bearer " + TOKEN
+        second_results = []
+        def first_send(status, payload):
+            self.assertEqual(status, 200)
+            page = json.loads(payload)
+            second = SimpleNamespace(headers=headers, command="GET",
+                path=api.PREFIX + "inventory?snapshot=" + page["snapshot"],
+                send=lambda code, body: second_results.append((code, body)))
+            # Client can send again after receiving the complete response bytes,
+            # while the first send() has not yet returned on the server thread.
+            self.api.handle(second)
+        first = SimpleNamespace(headers=headers, command="GET", path=api.PREFIX + "inventory", send=first_send)
+        self.api.handle(first)
+        self.assertEqual(second_results[0][0], 200)
+
+    def test_duplicate_authorization_header_rejected(self):
+        with self.http() as (base, opener, server):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            conn.putrequest("GET", api.PREFIX + "inventory")
+            conn.putheader("Authorization", "Bearer " + TOKEN)
+            conn.putheader("Authorization", "Bearer " + TOKEN)
+            conn.endheaders()
+            response = conn.getresponse()
+            self.assertEqual(response.status, 401)
+            response.read(); conn.close()
+
+    def test_bounded_server_refuses_excess_and_recovers(self):
+        with self.http() as (base, opener, server):
+            for _ in range(16): self.assertTrue(server.request_slots.acquire(blocking=False))
+            try:
+                sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+                try:
+                    sock.sendall(b"GET / HTTP/1.0\r\n\r\n")
+                    try: self.assertEqual(sock.recv(100), b"")
+                    except ConnectionResetError: pass
+                finally: sock.close()
+            finally:
+                for _ in range(16): server.request_slots.release()
+            self.request(opener, base)
+
+    def test_revocation_during_inventory_does_not_send_data(self):
+        self.put()
+        real_hash = self.api.hash_prefix
+        def revoked(*args):
+            result = real_hash(*args)
+            self.options["transcript_export_enabled"] = False
+            return result
+        with self.http() as (base, opener, server), patch.object(self.api, "hash_prefix", revoked):
+            with self.assertRaises(urllib.error.HTTPError) as error: self.request(opener, base)
+            self.assertEqual(error.exception.code, 401)
+            body = error.exception.read()
+            self.assertNotIn(b"fixture", body)
+            self.assertNotIn(TOKEN.encode(), body)
+            self.assertFalse(self.api.sessions)
+
+    def test_http_full_reference_client_probe(self):
+        originals = {}
+        for floor in ("upstairs", "downstairs"):
+            for i in range(10):
+                content = (f"Synthetic {floor} {i}\r\n".encode() + b"\xff\x00") * 1000
+                self.put(f"same-{i}.txt", content, floor)
+                originals[(floor, f"same-{i}.txt")] = content
+        received = {}
+        with self.http() as (base, opener, _):
+            def transport(path):
+                req = urllib.request.Request(base + path, headers={"Authorization": "Bearer " + TOKEN})
+                with opener.open(req, timeout=5) as response:
+                    raw = response.read()
+                    self.assertLess(len(json.dumps({"data": raw.decode()}).encode()), 50 * 1024)
+                    return json.loads(raw)
+            result = retrieve(transport, lambda record, meta, chunks: received.update({(record["floor"], record["source_name"]): b"".join(chunks)}))
+        self.assertEqual(originals, received)
+        self.assertTrue(result["complete"])
+
+
+if __name__ == "__main__": unittest.main()
