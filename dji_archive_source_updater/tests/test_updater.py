@@ -832,5 +832,95 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(self.start("rollback")["status"],"rolled_back")
         self.assert_source(self.baseline)
 
+    def test_source_mismatch_reports_only_fixed_hashes_and_modes(self):
+        data=b"PRIVATE CHANGED SOURCE CONTENT"
+        (self.app/"server.py").write_bytes(data)
+        with self.assertRaises(u.SourceMismatch) as caught:self.updater.inspect()
+        result=caught.exception.report
+        self.assertEqual(result["status"],"refused")
+        self.assertFalse(result["source_verified"])
+        self.assertTrue(result["diagnosis_complete"])
+        self.assertNotIn("source_fingerprint",result)
+        self.assertEqual(result["mismatch_count"],1)
+        row=result["mismatches"][0]
+        self.assertEqual(row["file"],"server.py")
+        self.assertEqual(row["expected_baseline"],self.manifest["baseline"]["files"]["server.py"])
+        self.assertEqual(row["expected_payload"],self.manifest["payload"]["files"]["server.py"])
+        self.assertEqual(row["observed"],{"sha256":u.digest(data),"mode":0o644})
+        self.assertNotIn("PRIVATE",json.dumps(result))
+        self.assertNotIn("export.py",json.dumps(result))
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_source_mode_mismatch_does_not_accept_baseline_hash(self):
+        (self.app/"server.py").chmod(0o755)
+        with self.assertRaises(u.SourceMismatch) as caught:self.updater.inspect()
+        row=caught.exception.report["mismatches"][0]
+        self.assertEqual(row["observed"]["sha256"],row["expected_baseline"]["sha256"])
+        self.assertEqual(row["observed"]["mode"],0o755)
+        self.assertEqual(row["expected_baseline"]["mode"],0o644)
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_source_mismatch_never_reads_extras_or_writes(self):
+        metadata=self.make_extras()
+        (self.app/"server.py").write_bytes(b"UNREVIEWED SOURCE")
+        original=u.os.open
+        def no_extra(path,*args,**kwargs):
+            self.assertNotIn(path,metadata)
+            return original(path,*args,**kwargs)
+        with mock.patch.object(u.os,"open",no_extra), \
+             mock.patch.object(u.os,"write",side_effect=AssertionError("write")), \
+             mock.patch.object(u.os,"mkdir",side_effect=AssertionError("mkdir")), \
+             mock.patch.object(u.os,"unlink",side_effect=AssertionError("unlink")), \
+             mock.patch.object(u,"rename_atomic",side_effect=AssertionError("rename")):
+            with self.assertRaises(u.SourceMismatch) as caught:self.updater.inspect()
+        self.assertNotIn("legacy-stage.bin",json.dumps(caught.exception.report))
+        self.assert_extras_unchanged(metadata)
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_source_mismatch_guard_rejects_raced_snapshot(self):
+        (self.app/"server.py").write_bytes(b"first change")
+        original=self.updater.classify
+        def race(current):
+            try:return original(current)
+            finally:(self.app/"server.py").write_bytes(b"second change")
+        with mock.patch.object(self.updater,"classify",race):
+            with self.assertRaises(u.Refused) as caught:self.updater.inspect()
+        self.assertNotIsInstance(caught.exception,u.SourceMismatch)
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_source_mismatch_cli_exits_one_and_does_not_emit_options(self):
+        cfg=json.loads(self.baseline["config.json"])
+        cfg["options"]={"private":"DO_NOT_EMIT_THIS_VALUE"}
+        (self.app/"config.json").write_text(json.dumps(cfg))
+        options=Path(self.temp.name)/"options.json";options.write_text('{"mode":"inspect"}')
+        stdout=io.StringIO();argv=["updater.py","--root",str(self.root),"--bundle",str(self.bundle),"--options",str(options)]
+        with mock.patch.object(sys,"argv",argv),contextlib.redirect_stdout(stdout):
+            self.assertEqual(u.main(),1)
+        self.assertEqual(len(stdout.getvalue().splitlines()),1)
+        self.assertNotIn("DO_NOT_EMIT",stdout.getvalue())
+        report=json.loads(stdout.getvalue())
+        self.assertEqual(report["mismatches"][0]["file"],"config.json")
+        self.assertNotIn("source_fingerprint",report)
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_source_mismatch_report_is_bounded_with_explicit_omission(self):
+        item=(b"different",(self.app/"server.py").stat())
+        names=[("name-%03d-"%i)+"x"*100+".py" for i in range(100)]
+        self.updater.names=names
+        self.updater.base={n:{"sha256":"0"*64,"mode":0o644} for n in names}
+        self.updater.target={n:{"sha256":"1"*64,"mode":0o644} for n in names}
+        report=self.updater.mismatch_report({n:item for n in names})
+        self.assertLessEqual(len(json.dumps(report,sort_keys=True,ensure_ascii=True).encode("ascii")),u.DIAGNOSTIC_REPORT_BYTES)
+        self.assertFalse(report["diagnosis_complete"])
+        self.assertEqual(report["mismatch_count"],100)
+        self.assertEqual(report["reported_mismatches"]+report["omitted_mismatches"],100)
+
+    def test_source_mismatch_does_not_change_apply_refusal(self):
+        fingerprint=self.updater.inspect()["source_fingerprint"]
+        (self.app/"server.py").write_bytes(b"modified source")
+        with self.assertRaises(u.Refused):self.updater.run("apply",fingerprint)
+        self.assertFalse((self.root/u.STORE).exists())
+        self.assertEqual((self.app/"server.py").read_bytes(),b"modified source")
+
 
 if __name__=="__main__":unittest.main()

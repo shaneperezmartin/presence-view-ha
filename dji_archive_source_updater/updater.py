@@ -43,6 +43,12 @@ class Refused(Exception):
     """Safe, content-free reason suitable for the operator log."""
 
 
+class SourceMismatch(Refused):
+    def __init__(self, report):
+        super().__init__("Source hashes or modes do not match reviewed baseline/payload")
+        self.report = report
+
+
 class ConcurrentRace(Refused):
     pass
 
@@ -457,13 +463,44 @@ class Updater:
         require(phase != "mixed" or recovery, "Mixed source without verified recovery backup")
         return recovery
 
+    def mismatch_report(self, current):
+        rows = []
+        for name in self.names:
+            observed = file_info(current[name])
+            if observed not in (self.base.get(name), self.target[name]):
+                rows.append({"file": name, "expected_baseline": self.base.get(name),
+                             "expected_payload": self.target[name], "observed": observed})
+        result = {"status": "refused", "reason": "Source hashes or modes do not match reviewed baseline/payload",
+                  "source_verified": False, "mismatch_count": len(rows), "reported_mismatches": 0,
+                  "omitted_mismatches": len(rows), "diagnosis_complete": False, "mismatches": []}
+        for row in rows:
+            result["mismatches"].append(row)
+            if len(json.dumps(result, sort_keys=True, ensure_ascii=True).encode("ascii")) > DIAGNOSTIC_REPORT_BYTES - 64:
+                result["mismatches"].pop()
+                break
+        count = len(result["mismatches"])
+        result["reported_mismatches"] = count
+        result["omitted_mismatches"] = len(rows) - count
+        result["diagnosis_complete"] = count == len(rows)
+        require(len(json.dumps(result, sort_keys=True, ensure_ascii=True).encode("ascii")) <= DIAGNOSTIC_REPORT_BYTES,
+                "Source diagnostic exceeds output limit")
+        return result
+
     def inspect(self):
         with self.directory(self.rootpath) as root:
             child, _, ident = self.discover(root)
             with self.directory(child, root) as app:
                 require(inode(os.fstat(app)) == ident, "Target directory replaced")
                 current = self.capture(app)
-                phase, fingerprint = self.classify(current)
+                try:
+                    phase, fingerprint = self.classify(current)
+                except Refused as error:
+                    if str(error) != "Source hashes or modes do not match reviewed baseline/payload":
+                        raise
+                    # Recheck the exact known-source/extra snapshot before
+                    # exposing hashes. This never turns a mismatch into approval.
+                    self.guard(root, child, app, current)
+                    raise SourceMismatch(self.mismatch_report(current)) from None
                 self.guard(root, child, app, current)
                 return self.report(phase, fingerprint, self.existing_backup(root, phase, current["_preserved_extras"]))
 
@@ -813,7 +850,8 @@ def main():
     except (Refused, OSError, ValueError, TypeError, KeyError, RecursionError) as error:
         # OS errors and invalid input may contain paths or option content.
         reason = str(error) if isinstance(error, Refused) else "Filesystem or input validation failed"
-        print(json.dumps({"status": "refused", "reason": reason}), flush=True)
+        result = error.report if isinstance(error, SourceMismatch) else {"status": "refused", "reason": reason}
+        print(json.dumps(result, sort_keys=True, ensure_ascii=True), flush=True)
         return 1
     return 0
 

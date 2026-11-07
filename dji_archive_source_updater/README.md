@@ -23,6 +23,28 @@ app data. The fixed payload upgrades the original reviewed DJI Audio Archive
   quiescent during apply/recovery. The running recorder may continue recording:
   this changes its source tree, not its running image or `/data`.
 
+## Read-only source hash/mode mismatch report
+
+Version 1.0.3 expands only the existing `inspect` hash/mode refusal. If secure
+capture succeeds but a reviewed source file matches neither its baseline nor
+payload hash/mode, inspection rechecks the immutable snapshot and returns a
+structured refusal. Rows name only fixed manifest filenames and show expected
+baseline/payload SHA-256 and numeric Unix modes versus observed SHA-256/mode.
+Only mismatches are included. Baseline-absent new payload files are not reported
+as mismatches merely because they are absent.
+
+The result remains `status: refused`, `source_verified: false`, with exit status
+1 and **no apply fingerprint**. No file contents, option values, private extra
+names or extra content hashes are emitted. Existing unknown-extra, type/link,
+confinement, missing-file and concurrent-change gates remain unchanged. An unsafe
+or changing file produces a safe refusal instead of a hash report.
+
+Output stays below 8192 bytes. `diagnosis_complete`, `reported_mismatches` and
+`omitted_mismatches` are explicit. The fixed 23-file payload's worst-case complete
+mismatch report is verified to fit. If a future reviewed manifest exceeds the
+bound, an incomplete report is not authority to accept or replace any source.
+Investigate mismatches; do not substitute observed hashes into the baseline.
+
 ## Read-only diagnosis and continuation
 
 If `inspect` refuses because the target contains unexpected files/directories,

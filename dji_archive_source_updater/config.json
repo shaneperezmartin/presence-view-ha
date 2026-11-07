@@ -1,6 +1,6 @@
 {
   "name": "DJI Archive Source Updater",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "slug": "dji_archive_source_updater",
   "description": "Offline, manually started source-only updater with strict reviewed hashes",
   "arch": [
