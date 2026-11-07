@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import ctypes
 import errno
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
 import re
 import stat
 import sys
+import time
 import uuid
 
 import yaml
@@ -22,6 +25,13 @@ DIRFLAGS = FLAGS | os.O_DIRECTORY
 STORE = ".dji-source-updater"
 CONFIGS = ("config.json", "config.yaml", "config.yml")
 MAX_FILE = 16 * 1024 * 1024
+DIAGNOSTIC_SCAN_ENTRIES = 256
+DIAGNOSTIC_ROOT_ENTRIES = 256
+DIAGNOSTIC_SECONDS = 5.0
+DIAGNOSTIC_ENTRIES = 8
+DIAGNOSTIC_NAME_CHARS = 96
+DIAGNOSTIC_NAME_JSON_BYTES = 256
+DIAGNOSTIC_REPORT_BYTES = 8192
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 
@@ -48,6 +58,11 @@ def rename_atomic(src_fd, src, dst_fd, dst, exchange=False):
 def require(condition, message):
     if not condition:
         raise Refused(message)
+
+
+def check_diagnostic_budget(deadline):
+    if deadline is not None:
+        require(time.monotonic() <= deadline, "Diagnostic time budget exceeded")
 
 
 def canonical(obj):
@@ -205,11 +220,19 @@ class Updater:
         finally:
             os.close(fd)
 
-    def discover(self, root):
+    def discover(self, root, scan_limit=None, deadline=None):
+        check_diagnostic_budget(deadline)
         matches = []
+        if scan_limit is None:
+            children = os.listdir(root)
+        else:
+            with os.scandir(root) as scan:
+                children = [entry.name for entry in itertools.islice(scan, scan_limit + 1)]
+            require(len(children) <= scan_limit, "Local app discovery scan limit exceeded")
         # Home Assistant local app source folders are direct children. Hidden
         # storage is not an app and contains no config.{json,yaml,yml} anywhere.
-        for child in sorted(os.listdir(root)):
+        for child in sorted(children):
+            check_diagnostic_budget(deadline)
             if child.startswith("."):
                 continue
             entry = os.stat(child, dir_fd=root, follow_symlinks=False)
@@ -220,7 +243,9 @@ class Updater:
                 require(inode(entry) == inode(os.fstat(fd)), "App directory replaced during discovery")
                 candidates = []
                 for name in CONFIGS:
+                    check_diagnostic_budget(deadline)
                     value = read_at(fd, name)
+                    check_diagnostic_budget(deadline)
                     if value is not None:
                         candidates.append((name, parse_config(name, value[0])))
                 for name, cfg in candidates:
@@ -230,6 +255,67 @@ class Updater:
         require(len(matches) == 1, "Target slug absent or ambiguous")
         require(matches[0][1] == self.config, "Unexpected target config filename")
         return matches[0]
+
+    @staticmethod
+    def diagnostic_entry(name, st):
+        kinds = ((stat.S_ISREG, "regular_file"), (stat.S_ISDIR, "directory"),
+                 (stat.S_ISLNK, "symlink"), (stat.S_ISFIFO, "fifo"),
+                 (stat.S_ISSOCK, "socket"), (stat.S_ISCHR, "character_device"),
+                 (stat.S_ISBLK, "block_device"))
+        prefix = name[:DIAGNOSTIC_NAME_CHARS]
+        while len(json.dumps(prefix, ensure_ascii=True).encode("ascii")) > DIAGNOSTIC_NAME_JSON_BYTES:
+            prefix = prefix[:-1]
+        result = {"name": prefix, "name_truncated": prefix != name,
+                  "name_bytes_base64": base64.b64encode(os.fsencode(name)).decode("ascii"),
+                  "type": next((kind for predicate, kind in kinds if predicate(st.st_mode)), "other"),
+                  "mode": format(stat.S_IMODE(st.st_mode), "04o")}
+        if prefix != name:
+            result["name_sha256"] = digest(os.fsencode(name))
+        if stat.S_ISREG(st.st_mode):
+            result["size_bytes"] = st.st_size
+            result["link_count"] = st.st_nlink
+        return result
+
+    def diagnose(self):
+        """Read names/lstat metadata only; never approve source or issue a fingerprint."""
+        deadline = time.monotonic() + DIAGNOSTIC_SECONDS
+        with self.directory(self.rootpath) as root:
+            child, _, ident = self.discover(root, DIAGNOSTIC_ROOT_ENTRIES, deadline)
+            with self.directory(child, root) as app:
+                require(inode(os.fstat(app)) == ident, "Target directory replaced")
+                before = signature(os.fstat(app))
+                with os.scandir(app) as scan:
+                    entries = {entry.name for entry in itertools.islice(scan, DIAGNOSTIC_SCAN_ENTRIES)}
+                listing_truncated = len(entries) == DIAGNOSTIC_SCAN_ENTRIES
+                unknown = sorted(entries - set(self.names))
+                selected = unknown[:DIAGNOSTIC_ENTRIES]
+                metadata = {}
+                for name in selected:
+                    check_diagnostic_budget(deadline)
+                    metadata[name] = os.stat(name, dir_fd=app, follow_symlinks=False)
+                result = {"status": "diagnostic_only", "source_verified": False,
+                          "entries_scanned": len(entries), "listing_truncated": listing_truncated,
+                          "unexpected_count": len(unknown), "unexpected_count_is_exact": not listing_truncated,
+                          "reported_count": len(selected), "omitted_count_at_least": len(unknown) - len(selected),
+                          "unexpected_entries": [self.diagnostic_entry(name, metadata[name]) for name in selected]}
+                # Do not call capture/guard: they open source contents and
+                # correctly refuse extra entries. This mode is metadata-only.
+                with self.directory(self.rootpath) as current_root:
+                    require(inode(os.fstat(current_root)) == inode(os.fstat(root)), "Source mount replaced")
+                require(inode(os.stat(child, dir_fd=root, follow_symlinks=False)) == ident, "Target directory replaced")
+                require(self.discover(root, DIAGNOSTIC_ROOT_ENTRIES, deadline) == (child, self.config, ident), "Target discovery changed")
+                with os.scandir(app) as scan:
+                    after_entries = {entry.name for entry in itertools.islice(scan, DIAGNOSTIC_SCAN_ENTRIES)}
+                require(entries == after_entries and before == signature(os.fstat(app)),
+                        "Target entries changed during diagnosis")
+                for name, expected in metadata.items():
+                    check_diagnostic_budget(deadline)
+                    require(signature(os.stat(name, dir_fd=app, follow_symlinks=False)) == signature(expected),
+                            "Target entry changed during diagnosis")
+                check_diagnostic_budget(deadline)
+                require(len(json.dumps(result, sort_keys=True, ensure_ascii=True).encode("ascii")) <= DIAGNOSTIC_REPORT_BYTES,
+                        "Diagnostic metadata exceeds output limit")
+                return result
 
     def capture(self, app):
         self.app_identity = inode(os.fstat(app))
@@ -626,7 +712,12 @@ def main():
         require(set(options) <= {"mode", "expected_fingerprint", "transcript_export_token_sha256"}, "Unexpected updater option")
         mode = options.get("mode", "inspect")
         updater = Updater(args.root, args.bundle, options.get("transcript_export_token_sha256", ""))
-        result = updater.inspect() if mode == "inspect" else updater.run(mode, options.get("expected_fingerprint", ""))
+        if mode == "diagnose":
+            result = updater.diagnose()
+        elif mode == "inspect":
+            result = updater.inspect()
+        else:
+            result = updater.run(mode, options.get("expected_fingerprint", ""))
         print(json.dumps(result, sort_keys=True), flush=True)
     except (Refused, OSError, ValueError, TypeError, KeyError, RecursionError) as error:
         # OS errors and invalid input may contain paths or option content.

@@ -1,9 +1,14 @@
+import base64
+import contextlib
+import io
 import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
+import stat
+import sys
 import unittest
 from unittest import mock
 
@@ -416,6 +421,158 @@ class UpdaterTests(unittest.TestCase):
     def test_parent_directory_escape_refused(self):
         updater=u.Updater(self.root/".."/self.root.name,self.bundle)
         with self.assertRaises(u.Refused):updater.inspect()
+
+    def test_diagnose_unknown_types_without_reading_contents_or_writing(self):
+        (self.app/"unexpected-file").write_bytes(b"PRIVATE UNKNOWN CONTENT")
+        (self.app/"unexpected-dir").mkdir()
+        (self.app/"unexpected-dir"/"secret").write_bytes(b"PRIVATE NESTED CONTENT")
+        (self.app/"unexpected-link").symlink_to(self.outside/"not-present")
+        os.mkfifo(self.app/"unexpected-fifo")
+        before = {p.name: (p.lstat().st_mtime_ns,p.lstat().st_ctime_ns) for p in self.app.iterdir()}
+        original_open = u.os.open
+        def allow_discovery_only(path, flags, *args, **kwargs):
+            if not flags & os.O_DIRECTORY:
+                self.assertIn(path,u.CONFIGS,"Diagnostic opened non-config content")
+            return original_open(path,flags,*args,**kwargs)
+        with mock.patch.object(u.os,"open",allow_discovery_only), \
+             mock.patch.object(u.os,"write",side_effect=AssertionError("write forbidden")), \
+             mock.patch.object(u.os,"mkdir",side_effect=AssertionError("mkdir forbidden")), \
+             mock.patch.object(u.os,"unlink",side_effect=AssertionError("unlink forbidden")), \
+             mock.patch.object(u,"rename_atomic",side_effect=AssertionError("rename forbidden")):
+            report = self.updater.diagnose()
+        kinds = {item["name"]:item["type"] for item in report["unexpected_entries"]}
+        self.assertEqual(kinds,{"unexpected-file":"regular_file","unexpected-dir":"directory",
+                                "unexpected-link":"symlink","unexpected-fifo":"fifo"})
+        self.assertEqual(report["status"],"diagnostic_only")
+        self.assertFalse(report["source_verified"])
+        self.assertNotIn("source_fingerprint",report)
+        self.assertNotIn("PRIVATE",json.dumps(report))
+        self.assertNotIn("secret",json.dumps(report))
+        self.assertNotIn("not-present",json.dumps(report))
+        after = {p.name: (p.lstat().st_mtime_ns,p.lstat().st_ctime_ns) for p in self.app.iterdir()}
+        self.assertEqual(before,after)
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_diagnose_metadata_uses_no_follow(self):
+        (self.app/"unexpected-link").symlink_to(self.other/"private-file")
+        original = u.os.stat
+        calls=[]
+        def checked(path,*args,**kwargs):
+            if path == "unexpected-link":
+                self.assertIs(kwargs.get("follow_symlinks"),False)
+                calls.append(1)
+            return original(path,*args,**kwargs)
+        with mock.patch.object(u.os,"stat",checked): report=self.updater.diagnose()
+        self.assertEqual(len(calls),2)
+        item=report["unexpected_entries"][0]
+        self.assertEqual(item["type"],"symlink")
+        self.assertNotIn("size_bytes",item)
+
+    def test_diagnose_name_escaping_and_exact_bytes(self):
+        name='unexpected\n"\\\x1b[31m.bin'
+        (self.app/name).write_bytes(b"hidden")
+        report=self.updater.diagnose()
+        item=report["unexpected_entries"][0]
+        self.assertEqual(base64.b64decode(item["name_bytes_base64"]),os.fsencode(name))
+        encoded=json.dumps(report,ensure_ascii=True)
+        self.assertNotIn("\n",encoded)
+        self.assertNotIn("\x1b",encoded)
+        self.assertEqual(json.loads(encoded)["unexpected_entries"][0]["name"],name)
+
+    def test_diagnose_long_unicode_name_preview_and_total_bounds(self):
+        for i in range(12):
+            name="\U0001f600"*61+str(i)
+            (self.app/name).write_bytes(b"hidden")
+        report=self.updater.diagnose()
+        self.assertEqual(report["reported_count"],u.DIAGNOSTIC_ENTRIES)
+        self.assertEqual(report["omitted_count_at_least"],12-u.DIAGNOSTIC_ENTRIES)
+        self.assertTrue(report["unexpected_count_is_exact"])
+        self.assertLessEqual(len(json.dumps(report,sort_keys=True,ensure_ascii=True).encode("ascii")),u.DIAGNOSTIC_REPORT_BYTES)
+        for item in report["unexpected_entries"]:
+            raw=base64.b64decode(item["name_bytes_base64"])
+            self.assertTrue((self.app/os.fsdecode(raw)).exists())
+            self.assertTrue(item["name_truncated"])
+            self.assertEqual(item["name_sha256"],u.digest(raw))
+            self.assertLessEqual(len(item["name"]),u.DIAGNOSTIC_NAME_CHARS)
+            self.assertLessEqual(len(json.dumps(item["name"],ensure_ascii=True).encode("ascii")),u.DIAGNOSTIC_NAME_JSON_BYTES)
+
+    def test_diagnose_invalid_utf8_filename_is_exact_and_ascii_safe(self):
+        name=b"unexpected-\xff-\xfe"
+        fd=os.open(os.fsencode(self.app)+b"/"+name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        os.close(fd)
+        report=self.updater.diagnose()
+        encoded=json.dumps(report,ensure_ascii=True).encode("ascii")
+        self.assertEqual(base64.b64decode(report["unexpected_entries"][0]["name_bytes_base64"]),name)
+        self.assertLessEqual(len(encoded),u.DIAGNOSTIC_REPORT_BYTES)
+
+    def test_diagnose_scan_limit_marks_lower_bound(self):
+        for i in range(320): (self.app/("unknown-%03d"%i)).touch()
+        report=self.updater.diagnose()
+        self.assertEqual(report["entries_scanned"],u.DIAGNOSTIC_SCAN_ENTRIES)
+        self.assertTrue(report["listing_truncated"])
+        self.assertFalse(report["unexpected_count_is_exact"])
+        self.assertEqual(report["reported_count"],u.DIAGNOSTIC_ENTRIES)
+        self.assertLessEqual(report["unexpected_count"],u.DIAGNOSTIC_SCAN_ENTRIES)
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_diagnose_root_discovery_limit_refuses(self):
+        for i in range(260): (self.root/("other-%03d"%i)).mkdir()
+        with self.assertRaisesRegex(u.Refused,"discovery scan limit"):self.updater.diagnose()
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_diagnose_time_budget_refuses(self):
+        with mock.patch.object(u.time,"monotonic",side_effect=[100.0,106.0]):
+            with self.assertRaisesRegex(u.Refused,"time budget"):self.updater.diagnose()
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_diagnose_duplicate_slug_remains_refused(self):
+        (self.other/"config.json").write_bytes(self.baseline["config.json"])
+        with self.assertRaisesRegex(u.Refused,"ambiguous"):self.updater.diagnose()
+
+    def test_diagnose_target_symlink_remains_refused(self):
+        self.app.rename(self.outside/"app")
+        self.app.symlink_to(self.outside/"app",target_is_directory=True)
+        with self.assertRaises(u.Refused):self.updater.diagnose()
+
+    def test_diagnose_target_directory_swap_refused(self):
+        (self.app/"unexpected").touch()
+        original=u.Updater.diagnostic_entry
+        def swap(name,st):
+            self.app.rename(self.outside/"moved-app")
+            self.app.mkdir()
+            return original(name,st)
+        with mock.patch.object(self.updater,"diagnostic_entry",swap):
+            with self.assertRaisesRegex(u.Refused,"directory replaced"):self.updater.diagnose()
+        self.assertEqual(list(self.app.iterdir()),[])
+
+    def test_diagnose_does_not_broaden_inspect_or_apply(self):
+        fp=self.updater.inspect()["source_fingerprint"]
+        (self.app/"unexpected").touch()
+        self.assertEqual(self.updater.diagnose()["status"],"diagnostic_only")
+        with self.assertRaisesRegex(u.Refused,"Unexpected files"):self.updater.inspect()
+        with self.assertRaisesRegex(u.Refused,"Unexpected files"):self.updater.run("apply",fp)
+        self.assertFalse((self.root/u.STORE).exists())
+
+    def test_diagnose_empty_report_still_never_approves_source(self):
+        (self.app/"server.py").write_bytes(b"unreviewed known file")
+        result=self.updater.diagnose()
+        self.assertEqual(result["unexpected_count"],0)
+        self.assertFalse(result["source_verified"])
+        self.assertNotIn("source_fingerprint",result)
+        with self.assertRaises(u.Refused):self.updater.inspect()
+
+    def test_diagnose_cli_emits_one_escaped_json_line(self):
+        (self.app/"unexpected\nname").touch()
+        options=Path(self.temp.name)/"options.json"
+        options.write_text('{"mode":"diagnose"}')
+        stdout=io.StringIO()
+        argv=["updater.py","--root",str(self.root),"--bundle",str(self.bundle),"--options",str(options)]
+        with mock.patch.object(sys,"argv",argv),contextlib.redirect_stdout(stdout):
+            self.assertEqual(u.main(),0)
+        lines=stdout.getvalue().splitlines()
+        self.assertEqual(len(lines),1)
+        self.assertEqual(json.loads(lines[0])["status"],"diagnostic_only")
+        self.assertFalse((self.root/u.STORE).exists())
 
 
 if __name__=="__main__":unittest.main()

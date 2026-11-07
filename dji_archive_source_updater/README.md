@@ -23,6 +23,38 @@ app data. The fixed payload upgrades the original reviewed DJI Audio Archive
   quiescent during apply/recovery. The running recorder may continue recording:
   this changes its source tree, not its running image or `/data`.
 
+## Read-only diagnosis of unexpected entries
+
+If `inspect` refuses because the target contains unexpected files/directories,
+set `mode: diagnose` and start the updater once. This is diagnostic only: it
+never approves source, produces an apply fingerprint, changes the whitelist,
+reads unknown contents, follows unknown symlinks, enters unknown directories,
+or writes source/recovery data. Target discovery still requires the unique
+archive slug and the existing no-follow checks.
+
+After the existing bounded config reads needed for unique-slug discovery, the
+diagnostic scans at most 256 target-directory entries and reports up to 8
+unexpected direct-child names and their lstat type/mode. A scan reaching 256
+entries conservatively reports a truncated listing and lower-bound counts. Regular files also have size and link count. No symlink targets,
+file contents, unknown content hashes, owners, timestamps, or child listings are
+reported. Names are JSON-escaped, limited to 96 characters and 256 escaped
+bytes; truncated names include a filename-only SHA-256 for identification.
+Every reported entry includes its exact filename bytes encoded as base64, even
+when the display name is truncated or contains invalid UTF-8.
+Total output is limited to 8192 bytes; omitted-entry counts are explicit.
+The final consistency recheck has the same 256-entry target-directory bound.
+Diagnostic discovery refuses more than 256 local-root entries (using one
+lookahead entry). A five-second cooperative budget is checked between filesystem
+operations; it cannot interrupt a blocked kernel filesystem call. The existing
+config reads identify the target; no unexpected-entry contents are read.
+Concurrent directory/reported-entry changes cause refusal rather than a stale
+success result. Filename metadata is private runtime information: do not copy
+it into a public issue, source bundle or repository.
+
+A diagnostic result is not permission to remove an entry or accept different
+source. Investigate the result, then retain the original strict `inspect` and
+fingerprint-gated `apply` workflow. The default mode remains `inspect`.
+
 ## What is accepted
 
 The updater discovers a direct child of `/local_apps` by its config
