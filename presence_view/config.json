@@ -1,6 +1,6 @@
 {
   "name": "Presence View",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "slug": "presence_view",
   "description": "Read-only live target maps, sampled tracks and local heatmaps.",
   "arch": [
@@ -42,17 +42,21 @@
             "x": "str",
             "y": "str",
             "height": "str?",
-            "zero_pair_absent": "bool"
+            "zero_pair_absent": "bool",
+            "zero_triplet_absent": "bool?"
           }
         ],
         "notes": [
           "str"
-        ]
+        ],
+        "height_label": "str?",
+        "height_unit": "str?"
       }
     ],
     "retention_days": "int(1,365)",
     "history_budget_mb": "int(64,1024)"
   },
   "ports": {},
-  "map": []
+  "map": [],
+  "backup": "cold"
 }

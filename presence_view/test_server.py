@@ -17,6 +17,8 @@ class Tests(unittest.TestCase):
  def test_presence_unavailable(self):self.assertEqual(sensor_snapshot(C,states(pres='unavailable'))['targets'],[])
  def test_missing_axis(self):
   data=states();del data['sensor.x'];self.assertEqual(sensor_snapshot(C,data)['targets'],[])
+ def test_z_only_valid_origin(self):
+  c=dict(C,targets=[dict(C['targets'][0],height='sensor.z',zero_pair_absent=False,zero_triplet_absent=True)]);data=states(x=0,y=0);data['sensor.z']=state(50);self.assertEqual(len(sensor_snapshot(c,data)['targets']),1);data['sensor.z']=state(0);self.assertEqual(sensor_snapshot(c,data)['targets'],[])
  def test_no_height_invented(self):self.assertNotIn('height',sensor_snapshot(C,states())['targets'][0])
  def test_actual_height(self):
   c=dict(C,targets=[dict(C['targets'][0],height='sensor.height')]);data=states();data['sensor.height']=state(170)
@@ -29,6 +31,26 @@ class Tests(unittest.TestCase):
   self.assertEqual(len(r['sensors'][0]['points']),3);self.assertEqual(sum(p['weight_seconds'] for p in r['sensors'][0]['points']),6)
  def test_empty_history(self):
   r=reconstruct([C],{},0,4,'UTC');self.assertEqual(r['sensors'][0]['points'],[])
+ def test_history_known_empty(self):
+  hist={k:[v] for k,v in states(count=0,pres='off').items()}
+  start=stamp('2026-11-07T12:00:00Z');r=reconstruct([C],hist,start,start+4,'UTC')
+  self.assertEqual(r['sensors'][0]['history_status'],'no_targets')
+ def test_history_uncertainty_not_vacancy(self):
+  for changes in ({'pres':'unavailable'},{'count':'unknown'},{'count':0,'pres':'unknown'},{'count':0,'pres':'on'},{'count':1,'pres':'off'},{'x':0,'y':0}):
+   with self.subTest(changes=changes):
+    hist={k:[v] for k,v in states(**changes).items()}
+    start=stamp('2026-11-07T12:00:00Z');r=reconstruct([C],hist,start,start+4,'UTC')
+    self.assertEqual(r['sensors'][0]['points'],[])
+    self.assertEqual(r['sensors'][0]['history_status'],'no_valid_coordinates')
+ def test_history_missing_presence_not_vacancy(self):
+  hist={k:[v] for k,v in states(count=0,pres='off').items() if k!='binary_sensor.a'}
+  start=stamp('2026-11-07T12:00:00Z');r=reconstruct([C],hist,start,start+4,'UTC')
+  self.assertEqual(r['sensors'][0]['history_status'],'no_valid_coordinates')
+ def test_history_partial_unknown_not_vacancy(self):
+  hist={k:[v] for k,v in states(count=0,pres='off').items()}
+  hist['binary_sensor.a']=[state('unavailable'),state('off','2026-11-07T12:00:02Z')]
+  start=stamp('2026-11-07T12:00:00Z');r=reconstruct([C],hist,start,start+4,'UTC')
+  self.assertEqual(r['sensors'][0]['history_status'],'no_valid_coordinates')
  def test_missing_axis_history(self):
   hist={k:[v] for k,v in states().items() if k!='sensor.x'};r=reconstruct([C],hist,stamp('2026-11-07T12:00:00Z'),stamp('2026-11-07T12:00:04Z'),'UTC');self.assertEqual(r['sensors'][0]['points'],[])
  def test_subsample_disappearance_breaks(self):

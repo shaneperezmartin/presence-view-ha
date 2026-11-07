@@ -14,7 +14,7 @@ Coordinates are independent sensor-local frames, not a calibrated shared floorpl
 
 Home Assistant recorder history is used before local collection coverage. X/Y axes are joined as-of two-second samples. The app records observed snapshots every approximately two seconds, independent of whether the UI is open. Local heatmaps count time only between consecutive observations of a target; gaps longer than six seconds are excluded. Missing data, offline periods, unknown presence/count and inconsistent slot counts do not establish vacancy and do not produce active dots. Historic recorder changes may lack a device heartbeat, so historical reconstructions remain approximate.
 
-Default local retention is 30 days with a 512 MiB SQLite page budget. Journal overhead is additional. Oldest observations can be pruned earlier at the size limit. Collection pauses when less than 1 GiB free space remains. Coverage bounds do not imply uninterrupted observations. The database stays in app-private storage and can be included in encrypted app backups. No observations are uploaded by this app.
+Default local retention is 30 days with a 512 MiB SQLite page budget. Journal overhead is additional. Oldest observations can be pruned earlier at the size limit. Collection pauses when less than 1 GiB free space remains. Coverage bounds do not imply uninterrupted observations. The database stays in app-private storage and can be included in encrypted app backups. No observations are uploaded by this app. Backups use cold mode: collection pauses briefly while the app is stopped for a consistent database backup. The pause remains a coverage gap. Do not lower the storage budget below an existing database size without first preserving and migrating its data; SQLite cannot immediately shrink an existing database to a smaller limit.
 
 ## Installation and configuration
 
@@ -30,4 +30,6 @@ This is pre-release software. Unit tests run during the image build. Tests do no
 
 Stopping this app stops its collection without modifying sensors or dashboards. Preserve/export its history before uninstalling. Full Home Assistant backup restoration can overwrite unrelated later changes and should not be a routine rollback. Keep encrypted backups and recovery keys separate.
 
-Run the local tests with: python -m unittest -v test_server test_http test_history_store test_observation_tracks
+For devices that publish measured Z, configure `height`, `height_label` (for example, Z), and `height_unit` to match the actual field. Radar-relative elevation is not person stature. Set `zero_triplet_absent` only when the device uses (0,0,0) as an absent-slot placeholder, and use `zero_pair_absent: false` so a valid nonzero Z at the X/Y origin is retained. Out-of-range samples expand the plot extent rather than being silently hidden.
+
+Run the local tests with: python -m unittest -v test_server test_http test_history_store test_observation_tracks test_service_history

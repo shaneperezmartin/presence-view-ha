@@ -48,7 +48,7 @@ def sensor_entities(sensor):
     return ids
 
 def sensor_snapshot(config,states):
-    result={k:config.get(k) for k in ('id','name','model','bounds','unit','notes')}
+    result={k:config.get(k) for k in ('id','name','model','bounds','unit','notes','height_label','height_unit')}
     result['coordinate_support']=bool(config.get('targets'))
     result['height_support']=any(t.get('height') for t in config.get('targets',[]))
     raw_presence=source_value(config.get('presence'),states)
@@ -60,6 +60,8 @@ def sensor_snapshot(config,states):
     for target in config.get('targets',[]):
         x=number(source_value(target['x'],states)); y=number(source_value(target['y'],states))
         if x is None or y is None: continue
+        height=number(source_value(target.get('height'),states))
+        if target.get('zero_triplet_absent',False) and x==0 and y==0 and (height is None or height==0):continue
         if target.get('zero_pair_absent',False) and x==0 and y==0: continue
         if not valid_presence or not valid_count or result['presence'] is False or result['count']==0: continue
         point={'id':str(target['id']),'x':x,'y':y}
@@ -113,7 +115,7 @@ class PresenceService:
             states={s['entity_id']:s for s in self.ha.get('states') if s['entity_id'] in self.ids}
             now=time.time()
             result={'now':iso(now),'time_zone':self.zone,'sensors':[sensor_snapshot(c,states) for c in self.configs],
-                    'history_support':True,'recording':{'enabled':self.store is not None,'last_observation':self.last_observation,'error':self.storage_error,'coverage':self._coverage},'history_note':'History uses Home Assistant recorder data only. Target slots are not stable person identities; no measurements are invented.'}
+                    'history_support':True,'recording':{'enabled':self.store is not None,'last_observation':self.last_observation,'error':self.storage_error,'coverage':self._coverage},'history_note':'History combines Home Assistant recorder data before local coverage with app-local observations. Target slots are not stable person identities; no measurements are invented.'}
             self.cache=result; self.last_poll=time.monotonic()
             return result
     def start_collection(self):
@@ -167,10 +169,12 @@ class PresenceService:
             if 0<ha_end-start<0.000001:ha_end=start
             while cursor<ha_end:
                 until=min(cursor+3600,ha_end)
-                query_params={'filter_entity_id':','.join(sorted(self.ids)),'end_time':iso(until),'minimal_response':''}
-                if not any(isinstance(src,dict) and src.get('attribute') for c in self.configs for target in c.get('targets',[]) for src in target.values()): query_params['no_attributes']=''
+                query_params={'filter_entity_id':','.join(sorted(self.ids)),'end_time':iso(until),'significant_changes_only':'0'}
+                sources=[src for c in self.configs for src in [c.get('presence'),c.get('count')]+[target.get(k) for target in c.get('targets',[]) for k in ('x','y','height')]]
+                if not any(isinstance(src,dict) and src.get('attribute') for src in sources):
+                    query_params.update(minimal_response='',no_attributes='')
                 query=urlencode(query_params)
-                # Do not set significant_changes_only: coordinate events must be retained.
+                # Core defaults significant_changes_only to true; explicitly retain attribute-only changes too.
                 response=self.ha.get('history/period/'+quote(iso(cursor),safe='')+'?'+query)
                 for sequence in response:
                     if not sequence: continue
@@ -184,20 +188,24 @@ class PresenceService:
             result['end']=iso(end)
             for c, sensor in zip(self.configs,result['sensors']):
                 boundary=coverage.get(c['id'],{}).get('earliest',end)
-                sensor['points']=[p for p in sensor['points'] if stamp(p['t'])<boundary]
+                sensor['points']=[dict(p,weight_seconds=min(p['weight_seconds'],boundary-stamp(p['t']),end-stamp(p['t']))) for p in sensor['points'] if stamp(p['t'])<boundary]
                 query=local_queries.get(c['id'],{'samples':[]})
                 local_points=observation_tracks(query['samples'],start,end,c.get('unit'))
                 for p in local_points:p['segment']='local-'+str(p['segment'])
                 sensor['points'].extend(local_points)
                 sensor['sources']=['Home Assistant recorder before local coverage','App-local observations'] if self.store else ['Home Assistant recorder']
                 if sensor['points']:sensor['history_status']='available'
-                elif query['samples'] and all(r.get('count')==0 and r.get('status')=='online' for r in query['samples']):sensor['history_status']='no_targets'
+                elif query['samples'] and all(known_empty(r) for r in query['samples']) and (boundary<=start or sensor['history_status']=='no_targets'):sensor['history_status']='no_targets'
                 elif query['samples']:sensor['history_status']='no_valid_coordinates'
                 if query.get('truncated'):result['warnings'].append(c['name']+': local samples were truncated; select a shorter range.')
             result['warnings'].append('App-local heatmaps count only consecutive observed target samples, with gaps over 6 seconds excluded. Recording retention is bounded; coverage does not imply continuous data.')
             self.history_cache={key:(time.monotonic(),result)}
             return result
         finally: self.history_lock.release()
+
+def known_empty(snapshot):
+    """Only mutually consistent, known presence and count can establish vacancy."""
+    return snapshot.get('status')=='online' and snapshot.get('presence') is False and snapshot.get('count')==0
 
 def reconstruct(configs,histories,start,end,zone):
     """Join asynchronous coordinate axes as-of each timestamp; record 2-second samples.
@@ -216,7 +224,7 @@ def reconstruct(configs,histories,start,end,zone):
                     try: events.append((stamp(t),eid,row))
                     except (ValueError,TypeError): pass
         events.sort(key=lambda x:x[0]); current={}; index=0; points=[]; segment=defaultdict(int); was_active=set()
-        support=bool(config.get('targets'))
+        support=bool(config.get('targets')); sampled=False; all_empty=True
         if support:
             t=start
             while t<end:
@@ -226,6 +234,7 @@ def reconstruct(configs,histories,start,end,zone):
                     event_active={p['id'] for p in sensor_snapshot(config,current)['targets']}
                     was_active.intersection_update(event_active)
                 snap=sensor_snapshot(config,current); active=set()
+                sampled=True; all_empty=all_empty and known_empty(snap)
                 for p in snap['targets']:
                     pid=p['id']; active.add(pid)
                     if pid not in was_active: segment[pid]+=1
@@ -235,12 +244,12 @@ def reconstruct(configs,histories,start,end,zone):
         coordinate_ids={src if isinstance(src,str) else src['entity'] for target in config.get('targets',[]) for src in (target['x'],target['y'])}
         coordinate_history=bool(coordinate_ids) and all(histories.get(e) for e in coordinate_ids)
         result['sensors'].append({'id':config['id'],'points':points,'coordinate_support':support,
-            'history_status':'available' if points else 'no_targets' if coordinate_history else 'no_coordinate_history' if support else 'unsupported',
+            'history_status':'available' if points else 'no_targets' if coordinate_history and sampled and all_empty else 'no_valid_coordinates' if coordinate_history else 'no_coordinate_history' if support else 'unsupported',
             'entity_history_count':sum(bool(histories.get(e)) for e in ids),'sample_interval_seconds':2})
     return result
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='PresenceView/0.1'
+    server_version='PresenceView/0.2.1'
     def log_message(self,*args): pass  # Do not retain private presence/query details.
     def do_GET(self):
         # HA ingress is the sole ingress route. No host port is published.
