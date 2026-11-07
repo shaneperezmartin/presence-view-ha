@@ -1,0 +1,58 @@
+{
+  "name": "Presence View",
+  "version": "0.2.0",
+  "slug": "presence_view",
+  "description": "Read-only live target maps, sampled tracks and local heatmaps.",
+  "arch": [
+    "amd64",
+    "aarch64"
+  ],
+  "startup": "application",
+  "boot": "auto",
+  "init": false,
+  "ingress": true,
+  "ingress_port": 8099,
+  "panel_icon": "mdi:radar",
+  "homeassistant_api": true,
+  "hassio_api": false,
+  "host_network": false,
+  "options": {
+    "sensors": [],
+    "retention_days": 30,
+    "history_budget_mb": 512
+  },
+  "schema": {
+    "sensors": [
+      {
+        "id": "str",
+        "name": "str",
+        "model": "str",
+        "presence": "str",
+        "count": "str",
+        "unit": "str?",
+        "bounds": {
+          "xmin": "float",
+          "xmax": "float",
+          "ymin": "float",
+          "ymax": "float"
+        },
+        "targets": [
+          {
+            "id": "str",
+            "x": "str",
+            "y": "str",
+            "height": "str?",
+            "zero_pair_absent": "bool"
+          }
+        ],
+        "notes": [
+          "str"
+        ]
+      }
+    ],
+    "retention_days": "int(1,365)",
+    "history_budget_mb": "int(64,1024)"
+  },
+  "ports": {},
+  "map": []
+}
