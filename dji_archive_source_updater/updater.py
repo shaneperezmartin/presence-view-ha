@@ -160,7 +160,8 @@ def extra_metadata(st):
 
 def validate_manifest(manifest):
     require(set(manifest) == {"schema", "slug", "config", "baseline", "payload"}, "Invalid manifest fields")
-    require(manifest["schema"] == 1 and manifest["slug"] == "dji_audio_archive", "Unsupported manifest identity")
+    require(type(manifest["schema"]) is int and manifest["schema"] in (1, 2) and
+            manifest["slug"] == "dji_audio_archive", "Unsupported manifest identity")
     require(manifest["config"] in CONFIGS, "Unsupported application config name")
     for phase in ("baseline", "payload"):
         part = manifest[phase]
@@ -205,26 +206,51 @@ class Updater:
         cfg = parse_config(self.config, self.payload[self.config])
         require(cfg.get("slug") == self.manifest["slug"] and str(cfg.get("version")) == self.manifest["payload"]["version"],
                 "Payload config identity/version mismatch")
+        baseline_cfg = None
+        if self.manifest["schema"] == 2:
+            # Schema 2 pins a PUBLIC baseline template by the same exact hash
+            # and mode used for source verification. Never derive a baseline
+            # from observed source or accept an operator-supplied hash/override.
+            require(self.config == "config.json", "Public baseline template requires JSON config")
+            with self.directory(self.bundlepath) as fd:
+                require(set(os.listdir(fd)) == {"manifest.json", "files", "baseline-config.blob"},
+                        "Unexpected schema 2 bundle entries")
+                item = read_at(fd, "baseline-config.blob")
+                require(file_info(item) == self.base[self.config], "Baseline config template hash or mode mismatch")
+                baseline_cfg = parse_config(self.config, item[0])
+            require(baseline_cfg.get("slug") == self.manifest["slug"] and
+                    str(baseline_cfg.get("version")) == self.manifest["baseline"]["version"],
+                    "Baseline config template identity/version mismatch")
+            for template in (baseline_cfg, cfg):
+                defaults = template.get("options")
+                require(isinstance(defaults, dict) and defaults.get("transcript_export_enabled") is False and
+                        defaults.get("transcript_export_token_sha256") == "",
+                        "Public export defaults must be disabled and empty")
         require(isinstance(export_digest, str), "Export digest must be a string")
         if export_digest:
             require(re.fullmatch("[0-9a-f]{64}", export_digest) is not None,
                     "Export digest must be 64 lowercase hexadecimal characters")
             require(self.config == "config.json", "Private export defaults require JSON config")
-            defaults = cfg.get("options")
-            require(isinstance(defaults, dict) and defaults.get("transcript_export_enabled") is False and
-                    defaults.get("transcript_export_token_sha256") == "", "Public export defaults must be disabled and empty")
-            pristine = json.loads(json.dumps(cfg))
-            defaults["transcript_export_enabled"] = True
-            defaults["transcript_export_token_sha256"] = export_digest
-            # Accept no arbitrary override dictionary. The two assignments
-            # above are the entire customization interface.
-            check = json.loads(json.dumps(cfg))
-            check["options"]["transcript_export_enabled"] = False
-            check["options"]["transcript_export_token_sha256"] = ""
-            require(check == pristine, "Forbidden config customization")
-            data = (json.dumps(cfg, indent=2) + "\n").encode()
+            def customize(template):
+                defaults = template.get("options")
+                require(isinstance(defaults, dict) and defaults.get("transcript_export_enabled") is False and
+                        defaults.get("transcript_export_token_sha256") == "", "Public export defaults must be disabled and empty")
+                pristine = json.loads(json.dumps(template))
+                defaults["transcript_export_enabled"] = True
+                defaults["transcript_export_token_sha256"] = export_digest
+                # These two assignments are the entire customization interface.
+                check = json.loads(json.dumps(template))
+                check["options"]["transcript_export_enabled"] = False
+                check["options"]["transcript_export_token_sha256"] = ""
+                require(check == pristine, "Forbidden config customization")
+                return (json.dumps(template, indent=2) + "\n").encode()
+
+            data = customize(cfg)
             self.payload[self.config] = data
             self.target[self.config] = {"sha256": digest(data), "mode": self.target[self.config]["mode"]}
+            if baseline_cfg is not None:
+                baseline_data = customize(baseline_cfg)
+                self.base[self.config] = {"sha256": digest(baseline_data), "mode": self.base[self.config]["mode"]}
             self.bundle_id = digest(canonical(self.manifest))
             self.customized = True
 
@@ -437,6 +463,7 @@ class Updater:
     def report(self, phase, fingerprint, recovery=False):
         return {"status": phase, "bundle_sha256": self.bundle_id, "public_bundle_sha256": self.public_bundle_id,
                 "private_export_defaults": self.customized, "config_sha256": self.target[self.config]["sha256"],
+                "baseline_config_sha256": self.base[self.config]["sha256"],
                 "source_fingerprint": fingerprint,
                 "baseline_version": self.manifest["baseline"]["version"],
                 "payload_version": self.manifest["payload"]["version"],
@@ -468,6 +495,7 @@ class Updater:
         return "permissions-" + digest(canonical(self.manifest["baseline"]))
 
     def validate_permission_state(self, current):
+        require(self.manifest["schema"] == 1, "Permission normalization is unavailable for this source transaction")
         require(all(info["mode"] == 0o644 for info in self.base.values()), "Permission normalization requires a 0644 baseline")
         for name in self.names:
             item = current[name]

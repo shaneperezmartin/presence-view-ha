@@ -1,11 +1,24 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>DJI Audio Archive</title>
-<style>body{font:16px system-ui;background:#101924;color:#e9f0f8;max-width:1000px;margin:auto;padding:24px}h1{font-size:28px;margin-bottom:4px}p{line-height:1.5;color:#b8c7d8}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}section{background:#1b2838;border:1px solid #35465a;border-radius:12px;padding:20px;margin:18px 0}button,select{font:inherit;padding:12px 16px;border-radius:8px;border:1px solid #71849a;background:#283b50;color:white;cursor:pointer}button.on{background:#006b58;border-color:#28b998}button:disabled{opacity:.5;cursor:wait}.status{font-size:14px}.badge{color:#7ce8cf;font-weight:650}.warning{color:#ffd48a}a{color:#8fcbff}li{margin:14px 0;overflow-wrap:anywhere}small{display:block;color:#acbbcc;margin-top:5px}footer{margin-top:24px;color:#acbbcc;font-size:14px}h2{font-size:20px}.download-all{display:inline-block;padding:12px 16px;border:1px solid #8fcbff;border-radius:8px;text-decoration:none;background:#283b50}.download-all:focus-visible{outline:3px solid #7ce8cf;outline-offset:3px}</style>
+<style>body{font:16px system-ui;background:#101924;color:#e9f0f8;max-width:1000px;margin:auto;padding:24px}h1{font-size:28px;margin-bottom:4px}p{line-height:1.5;color:#b8c7d8}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}section{background:#1b2838;border:1px solid #35465a;border-radius:12px;padding:20px;margin:18px 0}button,select,input{font:inherit;padding:12px 16px;border-radius:8px;border:1px solid #71849a;background:#283b50;color:white;cursor:pointer}button.on{background:#006b58;border-color:#28b998}button:disabled{opacity:.5;cursor:not-allowed}.status{font-size:14px}.badge{color:#7ce8cf;font-weight:650}.warning{color:#ffd48a}a{color:#8fcbff}li{margin:14px 0;overflow-wrap:anywhere}small{display:block;color:#acbbcc;margin-top:5px}footer{margin-top:24px;color:#acbbcc;font-size:14px}h2{font-size:20px}.download-all{display:inline-block;padding:12px 16px;border:1px solid #8fcbff;border-radius:8px;text-decoration:none;background:#283b50}.download-all:focus-visible{outline:3px solid #7ce8cf;outline-offset:3px}.file-controls{display:flex;flex-wrap:wrap;gap:12px;align-items:end}.file-controls label{display:flex;flex-direction:column;gap:6px}.pagination{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{max-width:100%;box-sizing:border-box}button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #7ce8cf;outline-offset:3px}</style>
 <h1>DJI Audio Archive</h1><p>Private audio and transcripts, separated by floor.</p>
 <div class="grid"><section><h2>Record audio</h2><p>Ten-minute files · Seven-day retention</p><button id="recording" disabled>Loading…</button><p id="recordingStatus" class="status"></p></section><section><h2>Transcribe speech</h2><p>Ten-minute files · Thirty-day retention</p><button id="transcription" disabled>Loading…</button><p id="transcriptionStatus" class="status"></p></section></div>
 <p>Your selections remain saved through restarts. Switching off stops new capture; queued speech can finish processing afterward.</p>
 <p><a href="model-setup">Set up speaker labels</a></p><section><div id="health" class="badge">Checking service…</div><p id="error" class="warning"></p><p id="diarization"></p><small id="storage"></small></section>
-<section><h2>Download all transcripts</h2><p><a class="download-all" href="download-transcripts.zip" target="_blank" rel="noopener">Download all transcripts (.zip)</a></p><p>One private ZIP with all saved upstairs and downstairs transcript files, including files beyond the 100-file list below. Original text and speaker labels are preserved, with original UTC timestamps inside.</p><small>Recording keeps running. Unfinished files are snapshots; download again for later text and speaker labels. Check manifest.json in the ZIP for missing or shortened files. Downloaded copies are outside automatic retention.</small></section>
-<section><h2>Files</h2><p>Left microphone: upstairs. Right microphone: downstairs. Dates use M-D-Y and times use AM/PM in New York local time.</p><select id="floor"><option value="upstairs">Upstairs</option><option value="downstairs">Downstairs</option></select> <select id="kind"><option value="audio">Audio</option><option value="transcripts">Transcripts</option></select> <button id="refresh">Refresh files</button><ul id="files"><li>No files loaded.</li></ul><small>Shows the 100 most recent files for the selected floor. Downloaded copies have their own retention.</small></section>
+<section><h2>Download all transcripts</h2><p><a class="download-all" href="download-transcripts.zip" target="_blank" rel="noopener">Download all transcripts (.zip)</a></p><p>One private ZIP with all saved upstairs and downstairs transcript files, across the full retained archive. Original text and speaker labels are preserved, with original UTC timestamps inside.</p><small>Recording keeps running. Unfinished files are snapshots; download again for later text and speaker labels. Check manifest.json in the ZIP for missing or shortened files. Downloaded copies are outside automatic retention.</small></section>
+<section aria-labelledby="filesHeading"><h2 id="filesHeading">Files</h2>
+<p>Left microphone: upstairs. Right microphone: downstairs. All files means all files still retained in this app’s archive, not other Dell folders or deleted files. Retention is unchanged: audio seven days, transcripts thirty days, subject to storage caps.</p>
+<div class="file-controls">
+<label for="floor">Floor<select id="floor"><option value="upstairs">Upstairs</option><option value="downstairs">Downstairs</option></select></label>
+<label for="kind">File type<select id="kind"><option value="audio">Audio</option><option value="transcripts">Transcripts</option></select></label>
+<label for="from">From (inclusive)<input id="from" type="date" aria-describedby="dateHelp"></label>
+<label for="through">Through (inclusive)<input id="through" type="date" aria-describedby="dateHelp"></label>
+<button id="clearDates" type="button">Clear dates</button><button id="refresh" type="button">Refresh files</button>
+</div>
+<p id="dateHelp">Optional date range uses America/New_York local days. Files are ordered newest first by start time; files without a recognized timestamp use their modified time.</p>
+<p id="fileStatus" role="status" aria-live="polite"></p><p id="fileScope"></p>
+<nav class="pagination" aria-label="File pages"><button id="firstPage" type="button" disabled>First</button><button id="previousPage" type="button" disabled>Previous</button><span id="pageStatus">Page 0 of 0</span><button id="nextPage" type="button" disabled>Next</button><button id="lastPage" type="button" disabled>Last</button></nav>
+<ul id="files" aria-busy="false"><li>No files loaded.</li></ul>
+<small>50 files per page. Counts and date coverage are current at each load; capture and retention may change the archive between pages. Downloads open separately so this list stays available if a file expires. Audio includes completed .aac and in-progress .aac.part files; transcripts are .txt files. Downloaded copies have their own retention.</small></section>
 <section><h2>Speaker labels</h2><p>Anonymous labels are added after each transcript file closes. Labels reset for each floor and file. Mixed passages may contain more than one speaker; labels can be inaccurate.</p><p id="speakerStatus"></p><button id="modelCheck">Run model check</button><small>This check uses generated silence, keeps the microphone off, and requires both capture controls off.</small><p id="modelResult"></p></section>
 <footer>Local processing · No cloud upload · Assist remains separate<br>Transcript text and speaker labels can contain errors. Temporary audio for speaker labeling stays in memory when recording is off.</footer>
 <script>
@@ -14,7 +27,70 @@ async function speakerStatus(){try{const r=await fetch('api/diarization');if(!r.
 document.getElementById('modelCheck').onclick=async()=>{document.getElementById('modelCheck').disabled=true;try{const r=await fetch('api/diarization-test',{method:'POST',headers:{'Content-Type':'application/json','X-Archive-Control':'1'},body:JSON.stringify({test:'synthetic'})});if(!r.ok)throw Error();}catch(e){document.getElementById('modelResult').textContent='The check was not started; both capture controls must be off.';}await speakerStatus();};speakerStatus();setInterval(speakerStatus,3000);
 async function status(){try{let r=await fetch('api/status');if(!r.ok)throw Error();state=await r.json();for(let key of ['recording','transcription']){let b=document.getElementById(key);b.textContent=state[key]?'Turn off':'Turn on';b.className=state[key]?'on':'';b.disabled=busy;document.getElementById(key+'Status').textContent=state[key+'_active']?'Capturing now':state[key]?'Enabled · waiting for capture':'Off';}document.getElementById('health').textContent=state.capture_process_running?'Microphone capture active':state.queue_length?'Finishing queued transcripts':'Microphone capture idle';document.getElementById('error').textContent=state.error||'';document.getElementById('diarization').textContent=state.diarization;document.getElementById('storage').textContent=(state.free_bytes/1e9).toFixed(1)+' GB free · Audio cap '+state.audio_limit_gb+' GB · Transcript cap '+state.transcript_limit_mb+' MB · '+state.queue_length+' passages waiting';}catch(e){document.getElementById('health').textContent='Service unavailable';for(let key of ['recording','transcription'])document.getElementById(key).disabled=true;}}
 for(let key of ['recording','transcription'])document.getElementById(key).onclick=async()=>{busy=true;await status();try{let r=await fetch('api/control',{method:'POST',headers:{'Content-Type':'application/json','X-Archive-Control':'1'},body:JSON.stringify({control:key,enabled:!state[key]})});if(!r.ok)throw Error();}catch(e){alert('The change was not confirmed. Check the control state before retrying.');}finally{busy=false;await status();}};
-async function files(){let floor=document.getElementById('floor').value,kind=document.getElementById('kind').value,list=document.getElementById('files');list.replaceChildren();try{let r=await fetch('api/files?floor='+floor+'&kind='+kind);if(!r.ok)throw Error();let rows=await r.json();if(!rows.length){let li=document.createElement('li');li.textContent='No '+kind+' files for this floor yet.';list.append(li);}for(let row of rows){let li=document.createElement('li'),a=document.createElement('a'),s=document.createElement('small');a.href='download/'+kind+'/'+floor+'/'+encodeURIComponent(row.name);a.textContent=row.display_name||row.name;s.textContent=(row.bytes/1024).toFixed(1)+' KB'+(row.active?' · Still being written':'');li.append(a,s);list.append(li);}}catch(e){let li=document.createElement('li');li.textContent='Files could not be loaded.';list.append(li);}}
-document.getElementById('refresh').onclick=files;document.getElementById('kind').onchange=files;document.getElementById('floor').onchange=files;status();files();setInterval(()=>{if(!busy)status();},3000);
+// File browsing is independent of the capture controls and status polling.
+let filePage=1,filePages=0,fileLoading=false,fileSequence=0,fileAbort=null;
+const fileElement=id=>document.getElementById(id);
+function fileButtons(){
+  for(const id of ['firstPage','previousPage'])fileElement(id).disabled=fileLoading||filePage<=1||!filePages;
+  for(const id of ['nextPage','lastPage'])fileElement(id).disabled=fileLoading||!filePages||filePage>=filePages;
+}
+function validDate(value){
+  if(!value)return true;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(value)||value.slice(0,4)==='0000')return false;
+  const date=new Date(value+'T00:00:00Z');
+  return !Number.isNaN(date.getTime())&&date.toISOString().slice(0,10)===value;
+}
+function fileRange(oldest,newest){return oldest&&newest?oldest.local+' to '+newest.local:'None';}
+async function files(requestedPage=1){
+  const sequence=++fileSequence;
+  if(fileAbort)fileAbort.abort();
+  fileAbort=new AbortController();
+  const floor=fileElement('floor').value,kind=fileElement('kind').value;
+  const from=fileElement('from').value,through=fileElement('through').value,list=fileElement('files');
+  filePage=requestedPage;fileLoading=true;fileButtons();list.replaceChildren();list.setAttribute('aria-busy','true');
+  fileElement('fileScope').textContent='';fileElement('pageStatus').textContent='Loading page…';
+  fileElement('fileStatus').textContent='Loading files…';
+  try{
+    if(!validDate(from)||!validDate(through)||fileElement('from').validity?.badInput||fileElement('through').validity?.badInput)throw Error('Enter valid dates in the date fields.');
+    if(from&&through&&from>through)throw Error('From must be on or before Through.');
+    const query=new URLSearchParams({floor,kind,page:String(requestedPage),page_size:'50'});
+    if(from)query.set('from',from);if(through)query.set('through',through);
+    const response=await fetch('api/files?'+query,{signal:fileAbort.signal});
+    if(!response.ok)throw Error(response.status===400?'Check the selected floor, file type, and date range.':'Files could not be loaded. Try Refresh files.');
+    const result=await response.json();
+    if(sequence!==fileSequence)return;
+    filePage=result.page;filePages=result.pages;
+    const start=result.total?(result.page-1)*result.page_size+1:0;
+    const end=result.total?start+result.files.length-1:0;
+    fileElement('fileStatus').textContent=result.total
+      ?'Showing '+start+'–'+end+' of '+result.total+' matching files · '+result.retained_total+' retained for '+floor+' '+kind+'.'
+      :'No files match this floor, file type, and date range · '+result.retained_total+' retained for '+floor+' '+kind+'.';
+    if(result.undated_files)fileElement('fileStatus').textContent+=' '+result.undated_files+' retained files have unknown dates. Date filters omit them; date coverage includes only dated files.';
+    if(result.skipped_unavailable)fileElement('fileStatus').textContent+=' Some files became unavailable while listing; refresh for current results.';
+    fileElement('pageStatus').textContent='Page '+(filePages?filePage:0)+' of '+filePages;
+    fileElement('fileScope').textContent='Matching oldest → newest: '+fileRange(result.oldest,result.newest)+'. All retained oldest → newest: '+fileRange(result.retained_oldest,result.retained_newest)+'. Times: America/New_York.';
+    for(const row of result.files){
+      const li=document.createElement('li'),a=document.createElement('a'),details=document.createElement('small');
+      a.href='download/'+encodeURIComponent(kind)+'/'+encodeURIComponent(floor)+'/'+encodeURIComponent(row.name);
+      a.target='_blank';a.rel='noopener';a.textContent=row.display_name||row.name;
+      details.textContent=(row.bytes/1024).toFixed(1)+' KB'+(row.active?' · Still being written':'')+(row.started_local?' · '+row.started_local:'')+(row.date_source==='modified'?' · Date from file modified time':row.date_source==='unknown'?' · Date unknown':'');
+      li.append(a,details);list.append(li);
+    }
+    if(!result.files.length){const li=document.createElement('li');li.textContent='No matching files. Try another date range, floor, or file type.';list.append(li);}
+  }catch(error){
+    if(sequence!==fileSequence)return;
+    filePage=1;filePages=0;fileElement('pageStatus').textContent='Page 0 of 0';
+    fileElement('fileStatus').textContent=error.name==='AbortError'?'File loading canceled. Refresh to try again.':error.message||'Files could not be loaded. Try Refresh files.';
+  }finally{
+    if(sequence===fileSequence){fileLoading=false;list.setAttribute('aria-busy','false');fileButtons();}
+  }
+}
+fileElement('refresh').onclick=()=>files(filePage);
+for(const id of ['floor','kind','from','through'])fileElement(id).onchange=()=>files(1);
+fileElement('clearDates').onclick=()=>{fileElement('from').value='';fileElement('through').value='';return files(1);};
+for(const [id,page] of [['firstPage',()=>1],['previousPage',()=>filePage-1],['nextPage',()=>filePage+1],['lastPage',()=>filePages]]){
+  fileElement(id).onclick=()=>{if(!fileElement(id).disabled)return files(page());};
+}
+status();files();setInterval(()=>{if(!busy)status();},3000);
 </script></html>
 

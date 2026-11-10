@@ -1,0 +1,105 @@
+'use strict';
+// Synthetic DOM and fetch only: no browser, network, capture or private files.
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const html = fs.readFileSync(__dirname + '/index.html', 'utf8');
+const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+class Element {
+  constructor() { this.value=''; this.textContent=''; this.children=[]; this.disabled=false; this.attributes={}; this.validity={badInput:false}; }
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children=children; }
+  setAttribute(key,value) { this.attributes[key]=value; }
+}
+const flush = () => new Promise(resolve => setImmediate(resolve));
+function setup() {
+  const elements = Object.fromEntries([...html.matchAll(/id="([^"]+)"/g)].map(m=>[m[1],new Element()]));
+  elements.floor.value='upstairs'; elements.kind.value='audio';
+  const requests=[], controls=[], alerts=[];
+  const status={recording:false,transcription:false,free_bytes:1e9,queue_length:0};
+  const context=vm.createContext({document:{getElementById:id=>elements[id],createElement:()=>new Element()},URLSearchParams,AbortController,Date,Number,Error,setInterval:()=>{},alert:value=>alerts.push(value),fetch:(url,options={})=>{
+    if(url.startsWith('api/files?'))return new Promise((resolve,reject)=>requests.push({url,options,resolve,reject}));
+    if(url==='api/control'){ controls.push(options); return Promise.resolve({ok:true}); }
+    if(url==='api/status')return Promise.resolve({ok:true,json:async()=>status});
+    if(url==='api/diarization')return Promise.resolve({ok:true,json:async()=>({model_present:true})});
+    throw Error('Unexpected request '+url);
+  }});
+  vm.runInContext(script,context);
+  return {elements,requests,controls,alerts,status,context};
+}
+function result(overrides={}) {
+  return {files:[{name:'2026.aac',bytes:1024,started_local:'11-9-2026 8:00 PM',date_source:'filename'}],page:1,page_size:50,pages:3,total:101,retained_total:150,oldest:{local:'11-1-2026 8:00 AM'},newest:{local:'11-9-2026 8:00 PM'},retained_oldest:{local:'10-31-2026 8:00 AM'},retained_newest:{local:'11-9-2026 8:00 PM'},...overrides};
+}
+async function resolve(request,data=result()) { request.resolve({ok:true,json:async()=>data}); await flush(); }
+test('initial request, totals, scope, labels, retention and new-tab encoded links',async()=>{
+  const h=setup();assert.match(h.requests[0].url,/page=1&page_size=50/);
+  const name='<img src=x onerror=alert(1)> &?#.aac.part';
+  await resolve(h.requests[0],result({files:[{name,bytes:1,active:true,date_source:'modified'}]}));
+  const a=h.elements.files.children[0].children[0];
+  assert.equal(a.textContent,name);assert.equal(a.href,'download/audio/upstairs/'+encodeURIComponent(name));
+  assert.equal(a.target,'_blank');assert.equal(a.rel,'noopener');
+  assert.match(h.elements.files.children[0].children[1].textContent,/Still being written.*modified time/);
+  assert.match(h.elements.fileStatus.textContent,/of 101 matching files · 150 retained/);
+  assert.match(h.elements.fileScope.textContent,/10-31-2026/);
+  for(const id of ['floor','kind','from','through'])assert.ok(html.includes('for="'+id+'"'));
+  assert.match(html,/Retention is unchanged/);assert.doesNotMatch(script,/innerHTML/);
+});
+test('first, next, previous, last; final page clamp and refresh',async()=>{
+  const h=setup();await resolve(h.requests[0]);
+  assert.equal(h.elements.firstPage.disabled,true);h.elements.nextPage.onclick();
+  assert.match(h.requests[1].url,/page=2/);assert.equal(h.elements.lastPage.disabled,true);
+  h.elements.nextPage.onclick();assert.equal(h.requests.length,2);
+  await resolve(h.requests[1],result({page:2}));h.elements.previousPage.onclick();
+  await resolve(h.requests[2]);h.elements.lastPage.onclick();assert.match(h.requests[3].url,/page=3/);
+  await resolve(h.requests[3],result({page:2,pages:2,total:51}));
+  assert.equal(h.elements.pageStatus.textContent,'Page 2 of 2');assert.equal(h.elements.nextPage.disabled,true);
+  h.elements.refresh.onclick();assert.match(h.requests[4].url,/page=2/);await resolve(h.requests[4],result({page:2,pages:2,total:51}));
+  h.elements.firstPage.onclick();assert.match(h.requests[5].url,/page=1/);
+});
+test('filter resets, inclusive date parameters and clear dates',async()=>{
+  const h=setup();await resolve(h.requests[0],result({page:3}));
+  h.elements.from.value='2026-11-01';h.elements.through.value='2026-11-09';h.elements.kind.value='transcripts';h.elements.floor.value='downstairs';
+  h.elements.kind.onchange();h.elements.refresh.onclick();assert.match(h.requests[2].url,/page=1/);assert.match(h.requests[1].url,/floor=downstairs&kind=transcripts&page=1&page_size=50&from=2026-11-01&through=2026-11-09/);
+  await resolve(h.requests[2],result({files:[{name:'a.txt',bytes:0}]}));
+  assert.equal(h.elements.files.children[0].children[0].href,'download/transcripts/downstairs/a.txt');
+  h.elements.clearDates.onclick();assert.equal(h.elements.from.value,'');assert.equal(h.elements.through.value,'');assert.doesNotMatch(h.requests[3].url,/from=|through=/);
+});
+test('invalid and reversed dates abort pending request without fetching',async()=>{
+  const h=setup();h.elements.from.value='2026-02-30';await h.elements.from.onchange();
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].options.signal.aborted,true);
+  assert.match(h.elements.fileStatus.textContent,/valid dates/);
+  h.elements.from.value='2026-11-10';h.elements.through.value='2026-11-01';await h.elements.through.onchange();
+  assert.match(h.elements.fileStatus.textContent,/on or before/);
+  await resolve(h.requests[0]);assert.match(h.elements.fileStatus.textContent,/on or before/);
+});
+test('new filters and repeated refresh supersede slow success and failure',async()=>{
+  const h=setup();h.elements.floor.value='downstairs';h.elements.floor.onchange();
+  h.elements.refresh.onclick();assert.equal(h.requests[0].options.signal.aborted,true);assert.equal(h.requests[1].options.signal.aborted,true);
+  await resolve(h.requests[2],result({total:1,pages:1,retained_total:1}));
+  const message=h.elements.fileStatus.textContent;
+  await resolve(h.requests[0]);h.requests[1].reject(Error('stale failure'));await flush();
+  assert.equal(h.elements.fileStatus.textContent,message);assert.match(message,/downstairs/);
+  assert.equal(h.elements.files.attributes['aria-busy'],'false');
+});
+test('empty pages and server failure can recover via refresh',async()=>{
+  const h=setup();await resolve(h.requests[0],result({files:[],total:0,pages:0,oldest:null,newest:null}));
+  assert.equal(h.elements.pageStatus.textContent,'Page 0 of 0');assert.match(h.elements.fileScope.textContent,/Matching oldest → newest: None/);
+  for(const id of ['firstPage','previousPage','nextPage','lastPage'])assert.equal(h.elements[id].disabled,true);
+  h.elements.refresh.onclick();h.requests[1].resolve({ok:false,status:400});await flush();assert.match(h.elements.fileStatus.textContent,/Check the selected/);
+  h.elements.refresh.onclick();h.requests[2].reject(Error('Network unavailable'));await flush();assert.match(h.elements.fileStatus.textContent,/Network unavailable/);
+  h.elements.refresh.onclick();await resolve(h.requests[3]);assert.equal(h.elements.nextPage.disabled,false);
+});
+test('existing capture control and model/download-all markup preserved',async()=>{
+  const h=setup();await flush();await h.elements.recording.onclick();
+  assert.equal(h.controls.length,1);assert.equal(h.controls[0].method,'POST');
+  assert.equal(h.controls[0].headers['X-Archive-Control'],'1');assert.deepEqual(JSON.parse(h.controls[0].body),{control:'recording',enabled:true});
+  assert.equal(h.elements.recording.disabled,false);assert.equal(h.alerts.length,0);
+  assert.match(html,/href="download-transcripts.zip" target="_blank" rel="noopener"/);
+  assert.match(html,/href="model-setup"/);assert.match(script,/api\/diarization-test/);
+});
+test('unknown dates visibly explain filter omission and dated-only coverage',async()=>{
+  const h=setup();await resolve(h.requests[0],result({undated_files:2,files:[{name:'unknown.aac',bytes:0,started_local:null,date_source:'unknown'}]}));
+  assert.match(h.elements.fileStatus.textContent,/2 retained files have unknown dates\. Date filters omit them; date coverage includes only dated files/);
+  assert.match(h.elements.files.children[0].children[1].textContent,/Date unknown/);
+});

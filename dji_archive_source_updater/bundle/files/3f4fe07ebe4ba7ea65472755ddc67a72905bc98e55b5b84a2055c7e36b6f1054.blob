@@ -1,5 +1,81 @@
 # DJI Audio Archive
 
+## Version 0.2.5 - browse the full retained archive
+
+The **Files** section now shows every retained audio or transcript file for the
+selected floor, 50 per page, with **First**, **Previous**, **Next** and **Last**.
+Matching/retained totals and oldest/newest dates make the scope visible.
+Optional **From** and **Through** dates include the full selected New York local
+days, including 23-hour and 25-hour daylight-saving days. Clearing dates or
+changing floor/type starts at page one; Refresh reloads the current page.
+Files are newest-first by UTC capture start, with the name breaking ties.
+Unrecognized capture names use file modification time and are labeled as such;
+files with neither usable date remain visible without filters and are labeled
+unknown. Date coverage excludes those undated files.
+
+This browses only this app's private audio/transcript archive on the host,
+not unrelated Dell folders or other recording apps. Deleted files cannot be
+recovered by browsing. Audio retention is still seven days/20 GB total and
+transcript retention thirty days/500 MB total by default; existing configured
+caps remain effective. Archive contents are still excluded from app backups.
+Record/transcribe selections, status controls, processing, ZIP exports and the
+separate transcript-only bearer API are unchanged. No new port, credentials,
+permissions, dependencies or audio access through that bearer API are added.
+
+Counts describe the files observed during each fresh listing, not a frozen
+multi-page backup. Capture, labeling and retention can change them between
+pages. A disappearing entry is skipped and flagged; an obsolete final page is
+clamped to the new final page. Downloads open separately and a missing file
+shows a refresh notice, leaving the archive UI available. Rapid clicks/filter
+changes cannot replace newer results with a slow stale response.
+
+### Read-only listing contract
+
+`GET /api/files?kind=audio&floor=upstairs&page=1&page_size=50` returns an object
+with `files`, `page`, `page_size`, `pages`, matching `total`, `retained_total`,
+`oldest`, `newest`, `retained_oldest`, `retained_newest`, `timezone`,
+`skipped_unavailable` and `undated_files`. Date bounds `from=YYYY-MM-DD` and
+`through=YYYY-MM-DD` are optional and inclusive in America/New_York. `kind` is
+`audio` or `transcripts`; `floor` is `upstairs` or `downstairs`.
+
+Each row retains `name`, `display_name`, `bytes`, `active`, plus `started_utc`,
+`started_local` and `date_source` (`filename`, `modified`, or `unknown`). Scope
+objects contain `utc` and friendly `local` strings, or null for no dated files.
+An empty result has `page: 1`, `pages: 0`, `total: 0` and an empty file list.
+Requests with only the original kind/floor parameters still return the original
+array shape with at most 100 entries sorted by filename. Existing clients can
+opt into the new response by supplying page, page_size or date filters.
+
+All responses are no-store and ingress-only. Pages contain at most 100 rows;
+invalid, duplicate, unknown or oversized parameters receive HTTP 400. Scans
+run on HTTP workers, not the capture event loop, with at most two simultaneous
+scans, a ten-second enumeration budget and a 50,000-file safety ceiling per
+selection. Exceeding a bound fails explicitly with HTTP 503, never silently
+returns a partial catalogue or misleading total. File opens/listings pin the
+archive directory hierarchy on Linux and refuse symlinks, hardlinks, special
+files, traversal, other kinds/floors and unrelated file types. Original names
+are identifiers only; responses disclose no absolute paths or file contents.
+
+### Verification and deployment
+
+Run the complete synthetic Python suite with:
+`python -m unittest -v test_archive test_model_setup test_diarization test_presentation test_transcript_export test_transcript_api test_file_browser`
+
+Run navigation/concurrency/UI regression tests with `node --test test_files_ui.js`
+on a development host with Node. No new Node runtime dependency is needed in
+the app image. Python synthetic tests are included in the image self-test.
+Tests use temporary fixtures only, never HA, microphones or private recordings.
+
+Deploy only through an authorized app update. Preserve **all original effective
+options explicitly**, especially audio_source, Whisper/language settings,
+storage thresholds and the optional export settings. Generic defaults contain
+a placeholder audio source and a disabled export API, so replacing effective
+options with those defaults would break the existing setup. Preserve private
+app data and durable control state; do not turn on either capture control.
+Read back the version, all options and both off controls after the restart,
+then verify ingress browsing, existing downloads/export and idle capture.
+No archive migration, deletion, port change or credential rotation is required.
+
 ## Version 0.2.4 - private transcript-only proxy export
 
 The existing browser UI, ZIP download, recording controls, labeling, retention,

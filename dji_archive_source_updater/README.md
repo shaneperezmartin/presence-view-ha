@@ -1,10 +1,10 @@
 # DJI Archive Source Updater
 
-A temporary, manually started Home Assistant app that makes one narrow source
-change, then exits. It does **not** update a running container, stop recording,
+Version 1.1.0. A temporary, manually started Home Assistant app that makes one
+narrow source change, then exits. It does **not** update a running container, stop recording,
 call Home Assistant/Supervisor APIs, create credentials, or access audio/private
 app data. The fixed payload upgrades the original reviewed DJI Audio Archive
-0.2.2 source to 0.2.4. Unrecognized source is refused, including 0.2.3.
+0.2.4 source to 0.2.5. Unrecognized source is refused, including 0.2.3.
 
 ## Permissions and prerequisites
 
@@ -20,84 +20,22 @@ app data. The fixed payload upgrades the original reviewed DJI Audio Archive
 - All payload bytes are included in the image. Runtime does not use the network,
   download code, run shell commands, or read recordings/transcripts/models.
 - Keep source writers, editors, other updaters, builds and store refreshes
-  quiescent during apply/recovery. The running recorder may continue recording:
-  this changes its source tree, not its running image or `/data`.
+  quiescent during apply/recovery. Keep recording and transcription OFF, capture
+  stopped, the queue empty, and labeling idle throughout this rollout. This helper cannot enforce runtime
+  controls itself: the operator must verify them without enabling either one.
 
-## Separately approved permission tightening
+## No permission normalization
 
-Version 1.0.4 adds one narrowly scoped permission operation. **Permission to
-update source is not permission to change its security-sensitive file modes.**
-Use `normalize_permissions` only after explicit action-time approval for the
-exact reviewed baseline files currently at 0666 to be tightened to 0644. This
-package grants no standing or automatic authorization. Default startup/mode and
-platform permissions are unchanged; no live filenames are approved by this text.
-
-`inspect_permissions` is read-only. It accepts only original baseline source
-bytes, no added payload files, and baseline modes 0644/0666. Unknown hashes,
-other modes, unsafe files, missing files or unapproved extras refuse. It reports
-counts and a `perm:`-prefixed fingerprint binding the root/app identities, each
-source file's device/inode/hash/full mode/link count/size/owner/mtime/ctime,
-private extra metadata and any original recovery record. The token is not an
-ordinary source-update fingerprint and cannot be used for `apply`.
-
-After approval, `normalize_permissions` requires that exact token. Before the
-first source change it creates and verifies a private, durable backup under:
-
-`/local_apps/.dji-source-updater/permissions-<baseline-manifest-sha256>/`
-
-- `original.json` records original source identities, hashes and modes plus
-  preserved-extra metadata. Original 0666 modes are **audit information only**.
-- `original/<sha256-of-filename>.blob` contains original source bytes at mode
-  0600 inside 0700 directories. No extra-file contents are opened or backed up.
-- `ready.json` binds the completed backup to the original metadata record.
-- `intent-<sha256-of-filename>.json` is durably written before that file's chmod.
-  It records the fixed 0644 target and original bound file identity.
-
-The only source mutation is `fchmod` to 0644 on a read-only, no-follow descriptor
-for a verified baseline file currently at 0666. Files already 0644 are skipped.
-No content is replaced, no pathname/recursive chmod is used, no extra permissions
-are changed, and no app version, options, container or recording control is
-changed. Backups contain private configuration bytes and must never be published.
-
-Interrupted mixed 0666/0644 states can resume only when original identities,
-hashes, ownership, sizes, mtimes and extra metadata are unchanged, and any
-0666-to-0644 mode/ctime transition has its durable intent. Unexpected changes,
-corrupt backups, missing intents or incomplete original metadata refuse for
-review. A pending initial metadata write that cannot be validated refuses while
-source remains untouched. Successful tightening is never undone on failure.
-
-Operator sequence:
-
-1. Obtain explicit approval for this exact permission-tightening action. Keep
-   the existing approved private extra list and export digest unchanged.
-2. Set `mode: inspect_permissions`, start once, and require exact baseline bytes
-   plus the expected 0666/0644 counts. Record its `permission_fingerprint`.
-3. Only while that approval remains applicable, set `mode: normalize_permissions`
-   and `expected_fingerprint` to the exact `perm:` token; start once.
-4. Require `permissions_normalized` or `permissions_already_0644`, zero files at
-   0666, and all baseline files at 0644. Reset mode to `inspect` and clear the
-   old fingerprint. Obtain a fresh ordinary source-update fingerprint before
-   proceeding with any versioned update.
-5. If interrupted, stop and run `inspect_permissions`. Resume the same approved
-   operation only if recovery validates and no authorization/scope changed.
-   Otherwise investigate; do not delete recovery records to bypass a refusal.
-
-There is deliberately **no inverse action that replays 0666**. Restoring those
-world-writable permissions would require separate approval and a different
-explicit operation. Ordinary source apply/rollback still requires and restores
-0644, using its own separate backup; it never consumes the original 0666 audit
-modes. This operation is not an extension of the accepted source baseline.
-
-Source writers must remain quiescent. Descriptor binding prevents a last-moment
-pathname replacement from redirecting chmod onto the replacement file. A hostile
-writer can still mutate the verified inode between its last check and the
-syscall. Post-checks then refuse; unknown bytes are preserved and any already
-completed tightening remains. Advisory locking is not a security boundary
-against another process with the same filesystem authority.
+This package accepts only the reviewed 0644 source modes. Permission inspection
+and normalization modes are removed from its options schema, and both methods
+refuse schema 2 before creating storage or changing source. Historical schema 1
+code remains only to run the unchanged previous regression suite. This package
+ships a schema 2 transaction and cannot use permission normalization. Unexpected
+modes require investigation, not a chmod or a newly learned baseline.
 
 ## Read-only source hash/mode mismatch report
 
-Version 1.0.3 expands only the existing `inspect` hash/mode refusal. If secure
+The existing `inspect` hash/mode refusal remains read-only. If secure
 capture succeeds but a reviewed source file matches neither its baseline nor
 payload hash/mode, inspection rechecks the immutable snapshot and returns a
 structured refusal. Rows name only fixed manifest filenames and show expected
@@ -112,9 +50,10 @@ confinement, missing-file and concurrent-change gates remain unchanged. An unsaf
 or changing file produces a safe refusal instead of a hash report.
 
 Output stays below 8192 bytes. `diagnosis_complete`, `reported_mismatches` and
-`omitted_mismatches` are explicit. The fixed 23-file payload's worst-case complete
-mismatch report is verified to fit. If a future reviewed manifest exceeds the
-bound, an incomplete report is not authority to accept or replace any source.
+`omitted_mismatches` are explicit. The fixed 26-file payload can exceed the
+bound when many files differ: a worst-case 26-mismatch report lists 22 rows and
+explicitly omits 4. An incomplete report is never authority to accept or replace
+any source. The safety gate still checks every file and emits no fingerprint.
 Investigate mismatches; do not substitute observed hashes into the baseline.
 
 ## Read-only diagnosis and continuation
@@ -234,40 +173,62 @@ hash/mode, baseline manifest, and effective payload. Apply checks them again.
 A cooperative directory lock prevents a second updater. Snapshot comparisons
 before and after each change detect inode/content/metadata changes.
 
-## Optional private export activation
+## Exact public or customized 0.2.4 baseline
 
-The public payload defaults are export disabled and empty token digest. To
-activate export at the first updated startup, supply only the **SHA-256 digest**
-of the separately created export credential in the updater option
-`transcript_export_token_sha256`. Never put the raw token here.
+The schema 2 bundle includes the exact reviewed **public** 0.2.4 config as
+`baseline-config.blob`. Its hash and mode must match the baseline manifest, and
+its slug/version must match the baseline identity. Both public baseline and
+payload configs must have export disabled and an empty verifier. Public files
+must also be independently reviewed for unrelated private information; these
+export-default checks are not a general secret detector.
 
-The value must be exactly 64 lowercase hexadecimal characters. After verifying
-all public payload hashes, the updater privately changes only these two config
-options in memory:
+With an empty `transcript_export_token_sha256`, only the exact public baseline
+is accepted and export stays disabled. To preserve an already customized 0.2.4
+baseline, privately supply its **existing SHA-256 export verifier**, exactly 64
+lowercase hexadecimal characters. Never supply or request the usable raw token.
+The helper derives both the expected baseline and the 0.2.5 payload by applying
+only the original helper's two deterministic assignments in memory:
 
 - `transcript_export_enabled`: `false` to `true`
-- `transcript_export_token_sha256`: empty to the supplied digest
+- `transcript_export_token_sha256`: empty to the supplied verifier
 
-No other override fields are accepted. The effective config hash and payload
-fingerprint include this exact derived config. Logs report hashes/status, not
-the digest or source contents. Public image/repository files remain unchanged.
-The same digest must remain configured for inspect, apply, and rollback;
-changing or omitting it refuses the customized source. Preserve it privately
-through the rollback window. It is a verifier, not the usable export token.
-Existing installed options remain separate and override defaults; this route
-is for the original baseline that has no export options yet.
+Serialization remains exactly `json.dumps(config, indent=2) + "\n"`. No other
+option override is available. No observed live config bytes or learned hashes
+are accepted as an alternative baseline. Any other config edit, whitespace
+change, missing/wrong verifier, unexpected mode or source drift refuses.
+
+The private baseline and payload hashes both enter the effective transaction
+manifest and its ID. `public_bundle_sha256` identifies the reviewed generic
+manifest; `bundle_sha256` identifies the effective private transaction.
+`baseline_config_sha256` and `config_sha256` expose only config hashes, not the
+verifier or config contents. Verify the baseline config hash against the last
+accepted source evidence before apply. Public bundle bytes are never modified.
+
+Use the identical verifier and preserved-extra list for inspect, apply and
+rollback, including after reinstalling the helper. Rollback restores the exact
+backed-up 0.2.4 config bytes, not a public placeholder or 0.2.2 config. Different
+transactions use distinct recovery directories, leaving older backups intact.
+Do not use helper 1.0.4 for this transaction: its baseline is 0.2.2.
+
+Installed app options are separate from source defaults. Preserve every existing
+effective option explicitly when the platform submits its update request; never
+replace installed options with this public config's placeholder defaults.
 
 ## Preflight and rollout
 
 1. Confirm the original app identity is `local_dji_audio_archive` and the running
-   version is 0.2.2. Record its recording state without copying private content.
-2. Install this updater from the reviewed repository revision. Leave manual
+   version is 0.2.4. Verify recording/transcription OFF, capture stopped, queue
+   zero and labeling idle. Securely retain the effective options for comparison
+   and preserve them explicitly in the platform update. Never log secrets.
+2. Obtain authorization for publication, a protected local backup, temporary
+   helper installation with whole-`local_apps` write scope, and the ordinary
+   app update/restart. Install this exact reviewed helper revision. Leave manual
    startup and protection mode enabled. Do not install a second recorder app.
 3. Set `mode: inspect`, blank `expected_fingerprint`, and, if authorized, the
    private digest above. Start the updater and read its single status result.
    It exits. Inspection performs no source or recovery writes.
 4. Proceed only with `status: baseline`, reviewed public payload hash, expected
-   effective config hash, and the printed `source_fingerprint`. A refusal means
+   baseline and payload effective config hashes, and the printed `source_fingerprint`. A refusal means
    stop and investigate. Never substitute a newly learned baseline hash.
 5. Set `mode: apply` and `expected_fingerprint` to that exact preflight value;
    keep the same digest. Start once. The updater verifies a durable backup,
@@ -276,17 +237,21 @@ is for the original baseline that has no export options yet.
 6. Require `status: applied` (or verified `already_applied`). Run another
    `inspect` with the same digest and require `status: payload`. Preserve the
    bundle/config hashes for rollback. Do not refresh/build after any refusal.
-7. Refresh the Supervisor app store so it sees source 0.2.4. Use the original
-   app's ordinary **Update** action to 0.2.4. On Supervisor 2026.10.5 this builds
+7. Refresh the Supervisor app store so it sees source 0.2.5. Use the original
+   app's ordinary **Update** action to 0.2.5. On Supervisor 2026.10.5 this builds
    the replacement image first, then stops/restarts the original app, preserving
    identity, options and private `/data`. **Never use Rebuild:** it removes the
    existing image/container before building.
-8. Verify the original app is healthy, its version is 0.2.4, recording resumes,
-   and the authenticated transcript-only endpoint behaves as reviewed. A source
-   update alone does not prove any of these live properties.
+8. Verify the original app is healthy at 0.2.5, all saved effective options
+   are unchanged, both controls remain OFF, capture is stopped, the queue is
+   empty and labeling is idle. Verify paginated files/date filters and protected
+   downloads without capture, and the unchanged authenticated transcript-only
+   endpoint. Retention cleanup continues; this update cannot restore expired
+   files. Source verification alone proves none of these runtime properties.
 9. Reset updater mode to `inspect` before removing it. Remove the temporary
    updater once live verification succeeds. Recovery storage remains available.
-   Revoke the separate export credential when its authorized use ends.
+   Preserve the existing separate export credential for its existing purpose;
+   this update does not rotate or revoke it.
 
 ## Durable backup and interruption behavior
 
@@ -347,13 +312,13 @@ partially written object as a valid backup.
    `baseline`. Changed original files are restored byte-for-byte with original
    modes; added payload files are removed from the app by moving them into
    retained recovery storage; config/version is restored last.
-5. If the running app has **not** been updated, its original 0.2.2 image is still
+5. If the running app has **not** been updated, its original 0.2.4 image is still
    running: source rollback needs no recorder restart.
-6. If 0.2.4 has already been activated, refresh the app store, then use the
-   original app's ordinary versioned **Update to 0.2.2**. Supervisor 2026.10.5
+6. If 0.2.5 has already been activated, refresh the app store, then use the
+   original app's ordinary versioned **Update to 0.2.4**. Supervisor 2026.10.5
    permits a requested version different from the installed version, including
    this downgrade. It builds first and retains the existing image on build
-   failure. Do not use Rebuild. Verify original version, health and recording.
+   failure. Do not use Rebuild. Verify original version, health, saved options and both controls OFF.
    Source restoration by itself does **not** switch the running image.
 7. Retain recovery data until the rollback window closes. This updater never
    automatically deletes backups or retired files. Remove them later only with
@@ -386,20 +351,21 @@ late-writer bytes, corrupted backups/journals, every mid-write power cut,
 interrupted rollback, idempotence, private-default customization, bounded
 diagnostic pagination, and exact preserve-only extras across interruption.
 
-`tools/assemble.py` accepts a reviewed baseline hash/mode manifest, a public
-payload source directory, an explicit JSON filename whitelist, and an empty
-output directory. It copies **only** whitelisted public payload bytes. The
-baseline input format is `{"version":"0.2.2","files":{"filename":
-{"sha256":"64-lowercase-hex","mode":420}}}`. It never copies baseline source.
+`tools/assemble.py` accepts a reviewed baseline hash/mode manifest, the exact
+public baseline config, a public payload source directory, an explicit JSON
+filename whitelist, and an empty output directory. It copies **only** whitelisted public payload bytes. The
+baseline input format is `{"version":"0.2.4","files":{"filename":
+{"sha256":"64-lowercase-hex","mode":420}}}`. It includes only the exact public baseline config template, never live/private
+baseline bytes. Full original source backups are created only locally at apply.
 
 Example with generic local inputs:
 
-`python tools/assemble.py --baseline-manifest baseline-hashes.json --payload-source public-source --payload-files public-files.json --output bundle`
+`python tools/assemble.py --baseline-manifest baseline-hashes.json --baseline-config public-baseline/config.json --payload-source public-source --payload-files public-files.json --output bundle`
 
 The assembler is a packaging tool, not authority to trust arbitrary code.
 Review every payload file and secret-scan the final folder before publication.
 Exclude real credentials, recordings, transcripts, original private config,
 settings, machine/user paths, internal reports, caches and virtual environments.
 The image build runs synthetic tests and verifies the fixed payload manifest.
-Actual container build, Supervisor installation, live update, recording
-continuity and HA rollback must be separately verified in the intended runtime.
+Actual container build, Supervisor installation, live update, OFF-state
+preservation and HA rollback must be separately verified in the intended runtime.

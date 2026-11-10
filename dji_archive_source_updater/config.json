@@ -1,6 +1,6 @@
 {
   "name": "DJI Archive Source Updater",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "slug": "dji_archive_source_updater",
   "description": "Offline, manually started source-only updater with strict reviewed hashes",
   "arch": [
@@ -28,7 +28,7 @@
     "diagnostic_snapshot": ""
   },
   "schema": {
-    "mode": "list(inspect|diagnose|inspect_permissions|normalize_permissions|apply|rollback)",
+    "mode": "list(inspect|diagnose|apply|rollback)",
     "expected_fingerprint": "str",
     "transcript_export_token_sha256": "str",
     "preserve_extra_files": [

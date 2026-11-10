@@ -14,13 +14,14 @@ import urllib.parse
 import urllib.request
 from archive import Controller, FLOORS
 from model_setup import ModelSetup
-from presentation import formatted_chunks, friendly_name
+from presentation import formatted_chunks
+from file_browser import selection, list_files, open_file, label
 from transcript_export import inventory, write_export
 from transcript_api import TranscriptAPI, PREFIX as TRANSCRIPT_PREFIX
 
 BASE = "dji_audio_archive"
 DEVICE = {"identifiers": [BASE], "name": "DJI Audio Archive", "manufacturer": "Local project",
-          "model": "Two-floor audio archive", "sw_version": "0.2.4"}
+          "model": "Two-floor audio archive", "sw_version": "0.2.5"}
 
 
 def discovery():
@@ -166,6 +167,7 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server_version = "DJIArchive"
     export_lock = threading.BoundedSemaphore(1)
+    listing_lock = threading.BoundedSemaphore(2)
     def log_message(self, *args): pass
 
     def permitted(self):
@@ -215,6 +217,42 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.export_lock.release()
 
+    def download_file(self, kind, floor, name):
+        started = False
+        try:
+            with open_file(self.server.controller.archive, kind, floor, name) as (source, snapshot):
+                size = snapshot.st_size
+                output_size = size
+                if kind == "transcripts":
+                    output_size = sum(len(chunk) for chunk in formatted_chunks(source, size))
+                    source.seek(0)
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/aac" if kind == "audio" else "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(output_size))
+                self.send_header("Content-Disposition", f'attachment; filename="{label(name, floor, kind)}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                started = True
+                if kind == "transcripts":
+                    for chunk in formatted_chunks(source, size):
+                        self.wfile.write(chunk)
+                    return
+                remaining = size
+                while remaining:
+                    data = source.read(min(65536, remaining))
+                    if not data:
+                        break
+                    self.wfile.write(data)
+                    remaining -= len(data)
+        except (OSError, ValueError):
+            if not started:
+                self.send(404, b'<p>This archive file is no longer available. It may have expired or been replaced while processing.</p><p>Return to the archive tab and refresh the file list.</p>', "text/html; charset=utf-8")
+            else:
+                # A disconnected client or shortened file must not receive a
+                # second HTTP response in the partial download.
+                self.close_connection = True
+
     def do_GET(self):
         if urllib.parse.urlsplit(self.path).path.startswith(TRANSCRIPT_PREFIX):
             self.server.transcript_api.handle(self); return
@@ -234,16 +272,21 @@ class Handler(BaseHTTPRequestHandler):
                 async def snapshot(): return self.server.controller.status()
                 self.send(200, self.call(snapshot()))
             elif parsed.path == "/api/files":
-                query = urllib.parse.parse_qs(parsed.query)
-                kind = query.get("kind", ["audio"])[0]
-                floor = query.get("floor", ["upstairs"])[0]
-                if kind not in ("audio", "transcripts") or floor not in FLOORS: raise ValueError()
-                async def listing():
-                    archive = self.server.controller.archive
-                    paths = [p for p in archive.files(kind) if p.parent.name == floor]
-                    paths.sort(key=lambda p: p.name, reverse=True)
-                    return [{"name": p.name, "display_name": friendly_name(p.name, floor, kind), "bytes": p.stat().st_size, "active": archive.active[p] > 0} for p in paths[:100]]
-                self.send(200, self.call(listing()))
+                try:
+                    request = selection(parsed.query)
+                except (ValueError, UnicodeError):
+                    self.send(400, {"error": "Invalid file filters or pagination"}); return
+                if not self.listing_lock.acquire(blocking=False):
+                    self.send(503, {"error": "File listing busy; refresh shortly"}); return
+                try:
+                    # Directory I/O runs on this bounded HTTP worker, never the
+                    # capture/control event loop. Do not mutate archive state.
+                    result = list_files(self.server.controller.archive, request)
+                    self.send(200, result)
+                except (OverflowError, TimeoutError):
+                    self.send(503, {"error": "File listing exceeded its safety limit; no partial list was returned"})
+                finally:
+                    self.listing_lock.release()
             elif parsed.path == "/api/diagnostics":
                 self.send(200, self.call(self.server.controller.diagnostics(), timeout=20))
             elif parsed.path == "/download-transcripts.zip":
@@ -253,29 +296,7 @@ class Handler(BaseHTTPRequestHandler):
                 pieces = parsed.path.split("/")
                 if len(pieces) != 5: raise ValueError()
                 _, _, kind, floor, name = pieces
-                path = self.server.controller.archive.safe(kind, floor, urllib.parse.unquote(name))
-                with path.open("rb") as source:
-                    size = os.fstat(source.fileno()).st_size
-                    output_size = size
-                    if kind == "transcripts":
-                        output_size = sum(len(chunk) for chunk in formatted_chunks(source, size))
-                        source.seek(0)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "audio/aac" if kind == "audio" else "text/plain; charset=utf-8")
-                    self.send_header("Content-Length", str(output_size))
-                    self.send_header("Content-Disposition", f'attachment; filename="{friendly_name(path.name, floor, kind)}"')
-                    self.send_header("Cache-Control", "no-store")
-                    self.send_header("X-Content-Type-Options", "nosniff")
-                    self.end_headers()
-                    if kind == "transcripts":
-                        for chunk in formatted_chunks(source, size):
-                            self.wfile.write(chunk)
-                        return
-                    remaining = size
-                    while remaining:
-                        data = source.read(min(65536, remaining))
-                        if not data: break
-                        self.wfile.write(data); remaining -= len(data)
+                self.download_file(kind, floor, urllib.parse.unquote(name))
             else: self.send(404, {"error": "Not found"})
         except (ValueError, FileNotFoundError): self.send(404, {"error": "Not found"})
         except (BrokenPipeError, ConnectionResetError): pass
@@ -317,7 +338,7 @@ class Handler(BaseHTTPRequestHandler):
                     return not any(c.state.value.values()) and c.proc is None
                 if not self.call(idle()):
                     self.send(409, {"error": "Turn both controls off before self-test"}); return
-                result = subprocess.run(["python", "-m", "unittest", "-v", "test_archive", "test_model_setup", "test_diarization", "test_presentation", "test_transcript_export", "test_transcript_api"], cwd="/app", capture_output=True, text=True, timeout=60)
+                result = subprocess.run(["python", "-m", "unittest", "-v", "test_archive", "test_model_setup", "test_diarization", "test_presentation", "test_transcript_export", "test_transcript_api", "test_file_browser"], cwd="/app", capture_output=True, text=True, timeout=60)
                 self.send(200 if result.returncode == 0 else 500, {
                     "success": result.returncode == 0, "synthetic_only": True,
                     "microphone_accessed": False, "result": result.stderr[-14000:]})

@@ -283,7 +283,7 @@ class Controller:
         self.diarizer = Diarizer(self)
 
     def status(self):
-        return {"version": "0.2.4", **self.state.value,
+        return {"version": "0.2.5", **self.state.value,
                 "recording_active": self.recording_active,
                 "transcription_active": self.transcription_active,
                 "capture_process_running": self.proc is not None and self.proc.returncode is None,
