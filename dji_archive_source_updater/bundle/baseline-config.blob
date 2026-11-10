@@ -1,6 +1,6 @@
 {
   "name": "DJI Audio Archive",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "slug": "dji_audio_archive",
   "description": "Private per-floor audio recording and local transcription with persistent controls",
   "arch": [

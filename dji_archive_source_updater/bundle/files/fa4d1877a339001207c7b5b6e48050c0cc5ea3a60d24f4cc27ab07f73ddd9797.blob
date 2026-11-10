@@ -1,0 +1,459 @@
+"""Synthetic fixtures only; no HA, captured data, models, network services or writes outside temp dirs."""
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+import hashlib
+import http.client
+import io
+import json
+import os
+from pathlib import Path
+import socket
+import struct
+import tempfile
+import threading
+import time
+import tracemalloc
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+from urllib.parse import urlencode
+import zipfile
+
+from archive import Archive, DurableState
+import batch_export as batch
+import file_browser
+from server import Handler, BoundedHTTPServer
+from transcript_api import TranscriptAPI, PREFIX
+
+
+class BatchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.archive = Archive(Path(self.temp.name) / 'archive')
+
+    def put(self, name='fixture.aac', floor='upstairs', kind='audio', data=b'synthetic\x00\xff'):
+        path = self.archive.root / kind / floor / name
+        path.write_bytes(data)
+        return path
+
+    def selection(self, **args):
+        return batch.batch_selection(urlencode({'kind': 'audio', 'floor': 'both', **args}))
+
+    def catalog(self, **args):
+        request = self.selection(**args)
+        return request, *batch.inventory(self.archive, request)
+
+    def result(self, catalog=None, **args):
+        output = io.BytesIO()
+        report = batch.write_batch(self.archive, *(catalog or self.catalog(**args)), output)
+        bundle = zipfile.ZipFile(io.BytesIO(output.getvalue()))
+        self.addCleanup(bundle.close)
+        self.assertIsNone(bundle.testzip())
+        self.assertEqual(json.loads(bundle.read('manifest.json')), report)
+        return bundle, report
+
+    def test_all_combinations_and_pages_preserve_every_byte(self):
+        for kind in ('audio', 'transcripts'):
+            extension = '.aac' if kind == 'audio' else '.txt'
+            for floor in ('upstairs', 'downstairs'):
+                for index in range(121):
+                    self.put(f'fixture-{index:03}{extension}', floor, kind, f'{floor} {index}\r\n'.encode())
+            for scope, count in [('upstairs', 121), ('downstairs', 121), ('both', 242)]:
+                bundle, report = self.result(kind=kind, floor=scope)
+                self.assertEqual(report['expected_files'], count)
+                self.assertEqual(report['exported_files'], count)
+                self.assertTrue(report['complete'])
+                self.assertFalse(report['atomic_snapshot'])
+                for record in report['files']:
+                    source = (self.archive.root / kind / record['floor'] / record['source_name']).read_bytes()
+                    self.assertEqual(bundle.read(record['zip_entry']), source)
+                    self.assertEqual(record['sha256'], hashlib.sha256(source).hexdigest())
+                    compression = zipfile.ZIP_STORED if kind == 'audio' else zipfile.ZIP_DEFLATED
+                    self.assertEqual(bundle.getinfo(record['zip_entry']).compress_type, compression)
+
+    def test_dates_dst_25_and_23_hour_days_both_floors_types(self):
+        for day, stamps in [
+            ('2026-11-01', ['2026-11-01T03:59:59+00:00', '2026-11-01T04:00:00+00:00',
+                            '2026-11-01T05:30:00+00:00', '2026-11-01T06:30:00+00:00',
+                            '2026-11-02T04:59:59+00:00', '2026-11-02T05:00:00+00:00']),
+            ('2026-03-08', ['2026-03-08T04:59:59+00:00', '2026-03-08T05:00:00+00:00',
+                            '2026-03-09T03:59:59+00:00', '2026-03-09T04:00:00+00:00'])]:
+            for kind in ('audio', 'transcripts'):
+                for floor in ('upstairs', 'downstairs'):
+                    for stamp in stamps:
+                        name = datetime.fromisoformat(stamp).strftime('%Y%m%dT%H%M%S.%fZ') + '_aabbccdd' + ('.aac' if kind == 'audio' else '.txt')
+                        self.put(name, floor, kind)
+                for floor in ('upstairs', 'downstairs', 'both'):
+                    _, rows, summary = self.catalog(kind=kind, floor=floor, **{'from': day, 'through': day})
+                    self.assertEqual(len(rows), (len(stamps)-2) * (2 if floor == 'both' else 1))
+                    self.assertEqual(summary['selection']['timezone'], 'America/New_York')
+
+    def test_mtime_fallback_and_unknown_dates_explicit(self):
+        path = self.put('20269999T120000.000000Z_aabbccdd.aac')
+        stamp = datetime(2026, 11, 6, 4, 30, tzinfo=timezone.utc).timestamp()
+        os.utime(path, (stamp, stamp))
+        _, rows, summary = self.catalog(**{'from': '2026-11-05', 'through': '2026-11-05'})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['date_source'], 'modified')
+        with patch.object(batch, 'timestamp', return_value=(None, 'unknown')):
+            _, rows, summary = self.catalog()
+            self.assertEqual((len(rows), summary['unknown_date_files'], summary['excluded_unknown_date_files']), (1, 1, 0))
+            _, rows, summary = self.catalog(**{'from': '2026-01-01'})
+            self.assertEqual((len(rows), summary['unknown_date_files'], summary['excluded_unknown_date_files']), (0, 1, 1))
+
+    def test_invalid_selection_no_paths_paging_duplicate_or_unbounded_input(self):
+        for query in ('', 'kind=audio', 'floor=both', 'kind=all&floor=both',
+                      'kind=audio&floor=../upstairs', 'kind=audio&floor=both&page=1',
+                      'kind=audio&floor=both&kind=audio', 'kind=audio&floor=both&path=/etc',
+                      'kind=audio&floor=both&from=2026-02-29', 'kind=audio&floor=both&from=%ff',
+                      'kind=audio&floor=both&from=2026-11-02&through=2026-11-01',
+                      'kind=audio&floor=both&from=0000-01-01', 'kind=audio&floor=' + 'a'*2048):
+            with self.subTest(query=query[:100]), self.assertRaises((ValueError, UnicodeError)):
+                batch.batch_selection(query)
+        self.selection(**{'from': '2024-02-29'})
+        self.selection(**{'through': '2026-11-01'})
+
+    def test_empty_batch_and_zero_byte_files_valid(self):
+        bundle, report = self.result()
+        self.assertEqual(set(bundle.namelist()), {'README.txt', 'manifest.json'})
+        self.assertTrue(report['complete'])
+        self.put(data=b'')
+        bundle, report = self.result()
+        self.assertEqual(report['expected_files'], 1)
+        self.assertEqual(bundle.read(report['files'][0]['zip_entry']), b'')
+
+    def test_unfinished_and_active_audio_distinguished(self):
+        self.put('partial.aac.part')
+        active = self.put('active.aac')
+        self.put('final.aac')
+        self.archive.active[active] = 1
+        bundle, report = self.result()
+        self.assertEqual((report['active_files'], report['unfinished_audio_files']), (1, 2))
+        for row in report['files']:
+            unfinished = row['source_name'] != 'final.aac'
+            self.assertEqual(row['unfinished_audio_snapshot'], unfinished)
+            self.assertEqual('UNFINISHED SNAPSHOT' in row['zip_entry'], unfinished)
+            self.assertTrue(row['zip_entry'].endswith('.aac'))
+
+    def test_unsafe_special_collision_and_reserved_names_stay_unique(self):
+        for name in ['CON.aac', 'a?.aac', 'a*.aac', 'A_.aac', '.hidden.aac', '..a.aac',
+                     'hello\r\nInjected: yes.aac', '\u202eevil.aac', '\udcff.aac']:
+            self.put(name)
+        bundle, report = self.result()
+        names = [r['zip_entry'] for r in report['files']]
+        self.assertEqual(len({n.casefold() for n in names}), 9)
+        for name in names:
+            self.assertRegex(name, r'^audio/upstairs/[0-9]{5} - [a-zA-Z0-9._ -]+\.aac$')
+            self.assertNotIn('..', Path(name).parts)
+        self.assertIn('hello\r\nInjected: yes.aac', [r['source_name'] for r in report['files']])
+
+    def test_excludes_nonregular_symlink_hardlink_and_other_folders(self):
+        good = self.put()
+        outside = Path(self.temp.name) / 'outside.aac'; outside.write_bytes(b'external')
+        folder = good.parent
+        (folder / 'link.aac').symlink_to(outside)
+        os.link(outside, folder / 'hard.aac')
+        os.mkfifo(folder / 'fifo.aac')
+        (folder / 'directory.aac').mkdir()
+        self.put('ignored.json'); self.put('other.txt', kind='transcripts')
+        _, rows, _ = self.catalog()
+        self.assertEqual([r['name'] for r in rows], [good.name])
+
+    def test_swap_to_symlink_or_hardlink_before_open_skipped(self):
+        for style in ('symlink', 'hardlink'):
+            path = self.put()
+            catalog = self.catalog()
+            outside = Path(self.temp.name) / ('external-' + style); outside.write_bytes(b'external')
+            path.unlink()
+            path.symlink_to(outside) if style == 'symlink' else os.link(outside, path)
+            bundle, report = self.result(catalog)
+            self.assertEqual(report['skipped_files'], 1)
+            self.assertFalse(report['complete'])
+            self.assertNotIn(b'external', b''.join(bundle.read(n) for n in bundle.namelist()))
+            path.unlink()
+
+    def test_replacement_before_open_is_skipped(self):
+        path = self.put()
+        catalog = self.catalog()
+        replacement = path.with_suffix('.new'); replacement.write_bytes(b'replacement')
+        os.replace(replacement, path)
+        _, report = self.result(catalog)
+        self.assertEqual(report['files'][0]['status'], 'skipped_replaced')
+        self.assertFalse(report['complete'])
+
+    def test_file_removed_before_open_reported(self):
+        path = self.put()
+        catalog = self.catalog(); path.unlink()
+        _, report = self.result(catalog)
+        self.assertEqual(report['skipped_files'], 1)
+        self.assertFalse(report['complete'])
+
+    def test_grows_before_open_and_during_copy_capped_to_inventory(self):
+        for when in ('before_open', 'after_open'):
+            path = self.put(data=b'before')
+            catalog = self.catalog()
+            original = batch.open_file
+            @contextmanager
+            def opened(*args):
+                if when == 'before_open':
+                    with path.open('ab') as f: f.write(b'later')
+                with original(*args) as pair:
+                    if when == 'after_open':
+                        with path.open('ab') as f: f.write(b'later')
+                    yield pair
+            with patch.object(batch, 'open_file', opened):
+                bundle, report = self.result(catalog)
+            record = report['files'][0]
+            self.assertEqual(bundle.read(record['zip_entry']), b'before')
+            self.assertEqual(report['changed_files'], 1)
+            self.assertEqual(record['status'], 'exported_changed')
+            self.assertFalse(report['complete'])
+
+    def test_shrink_after_open_reports_short_bytes(self):
+        path = self.put(data=b'long before')
+        catalog = self.catalog(); original = batch.open_file
+        @contextmanager
+        def opened(*args):
+            with original(*args) as pair:
+                path.write_bytes(b'short')
+                yield pair
+        with patch.object(batch, 'open_file', opened):
+            bundle, report = self.result(catalog)
+        self.assertEqual(report['truncated_files'], 1)
+        self.assertEqual(report['files'][0]['status'], 'truncated')
+        self.assertEqual(bundle.read(report['files'][0]['zip_entry']), b'short')
+
+    def test_replace_or_remove_after_open_retains_pinned_bytes_and_reports(self):
+        for how in ('replace', 'remove'):
+            path = self.put(data=b'pinned')
+            catalog = self.catalog(); original = batch.open_file
+            @contextmanager
+            def opened(*args):
+                with original(*args) as pair:
+                    if how == 'remove': path.unlink()
+                    else:
+                        replacement = path.with_suffix('.new'); replacement.write_bytes(b'replacement')
+                        os.replace(replacement, path)
+                    yield pair
+            with patch.object(batch, 'open_file', opened):
+                bundle, report = self.result(catalog)
+            self.assertEqual(bundle.read(report['files'][0]['zip_entry']), b'pinned')
+            self.assertEqual(report['changed_files'], 1)
+            self.assertFalse(report['complete'])
+
+    def test_directory_swap_to_symlink_never_opens_outside(self):
+        path = self.put(); catalog = self.catalog()
+        outside = Path(self.temp.name) / 'outside'; outside.mkdir()
+        (outside / path.name).write_bytes(b'external')
+        path.parent.rename(path.parent.with_name('saved'))
+        path.parent.symlink_to(outside)
+        _, report = self.result(catalog)
+        self.assertEqual(report['skipped_files'], 1)
+
+    def test_inventory_uses_pinned_directory_during_swap(self):
+        path = self.put(); folder = path.parent; saved = folder.with_name('saved')
+        outside = Path(self.temp.name) / 'outside'; outside.mkdir()
+        (outside / 'outside.aac').write_bytes(b'external')
+        original = batch.archive_directory
+        @contextmanager
+        def opened(archive, kind, floor):
+            with original(archive, kind, floor) as directory:
+                if floor == 'upstairs':
+                    folder.rename(saved); folder.symlink_to(outside)
+                yield directory
+        with patch.object(batch, 'archive_directory', opened):
+            _, rows, _ = self.catalog(floor='upstairs')
+        self.assertEqual([r['name'] for r in rows], [path.name])
+
+    def test_unavailable_inventory_entry_count_prevents_complete_claim(self):
+        class Vanished:
+            name = 'gone.aac'
+            def stat(self, **kwargs): raise FileNotFoundError()
+        @contextmanager
+        def entries(directory): yield iter([Vanished()])
+        with patch.object(batch.os, 'scandir', entries):
+            catalog = self.catalog(floor='upstairs')
+        _, report = self.result(catalog)
+        self.assertEqual(report['unavailable_during_inventory'], 1)
+        self.assertFalse(report['complete'])
+
+    def test_safety_limits_count_irrelevant_entries_bytes_and_time(self):
+        self.put(); self.put('irrelevant.json')
+        for constant, value, error in [('MAX_FILES', 0, OverflowError), ('MAX_ENTRIES', 1, OverflowError),
+                                       ('MAX_BYTES', 1, OverflowError), ('MAX_INVENTORY_SECONDS', -1, TimeoutError)]:
+            with self.subTest(constant=constant), patch.object(batch, constant, value), self.assertRaises(error):
+                self.catalog()
+        with patch.object(batch, 'MAX_AUDIO_SECONDS', -1), self.assertRaises(OSError):
+            batch.write_batch(self.archive, *self.catalog(), io.BytesIO())
+
+    def test_type_specific_deadlines(self):
+        self.put()
+        self.put('text.txt', kind='transcripts')
+        self.assertEqual(batch.MAX_AUDIO_SECONDS, 12 * 3600)
+        self.assertEqual(batch.MAX_SECONDS, 30 * 60)
+        with patch.object(batch, 'MAX_SECONDS', -1):
+            self.assertTrue(self.result()[1]['complete'])
+            with self.assertRaises(OSError):
+                batch.write_batch(self.archive, *self.catalog(kind='transcripts'), io.BytesIO())
+
+    def test_read_error_manifest_and_later_files_continue(self):
+        self.put('a.aac'); self.put('b.aac')
+        original = batch.open_file
+        class Fault:
+            def __init__(self, source): self.source = source
+            def fileno(self): return self.source.fileno()
+            def read(self, size): raise OSError('synthetic file fault')
+        @contextmanager
+        def opened(*args):
+            with original(*args) as (source, snapshot):
+                yield (Fault(source) if args[-1] == 'a.aac' else source), snapshot
+        with patch.object(batch, 'open_file', opened):
+            _, report = self.result()
+        self.assertEqual(report['read_error_files'], 1)
+        self.assertEqual(report['files'][1]['status'], 'exported')
+        self.assertFalse(report['complete'])
+
+    def test_zip64_forced_and_large_directory_threshold(self):
+        self.put()
+        with patch.object(zipfile, 'ZIP64_LIMIT', 1):
+            bundle, report = self.result()
+            info = bundle.getinfo(report['files'][0]['zip_entry'])
+            self.assertGreaterEqual(info.extract_version, 45)
+            self.assertIn(b'\x01\x00', info.extra)
+        with patch.object(zipfile, 'ZIP_FILECOUNT_LIMIT', 1):
+            bundle, report = self.result()
+            self.assertTrue(report['complete'])
+
+    def test_large_audio_and_text_memory_bounded_no_staging_or_writes(self):
+        class Sink:
+            def write(self, data): return len(data)
+            def flush(self): pass
+        for kind, name in [('audio', 'large.aac'), ('transcripts', 'large.txt')]:
+            path = self.put(name, kind=kind, data=b'')
+            with path.open('wb') as f: f.truncate(64 * 1024 * 1024)
+            state = DurableState(Path(self.temp.name) / 'controls.json')
+            state.set('recording', False); state.set('transcription', False)
+            before = {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in Path(self.temp.name).rglob('*') if p.is_file()}
+            controls = (Path(self.temp.name) / 'controls.json').read_bytes()
+            active = dict(self.archive.active)
+            tracemalloc.start()
+            try:
+                batch.write_batch(self.archive, *self.catalog(kind=kind), Sink())
+                _, peak = tracemalloc.get_traced_memory()
+            finally: tracemalloc.stop()
+            self.assertLess(peak, 2 * 1024 * 1024)
+            self.assertEqual(before, {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in Path(self.temp.name).rglob('*') if p.is_file()})
+            self.assertEqual((Path(self.temp.name) / 'controls.json').read_bytes(), controls)
+            self.assertEqual(dict(self.archive.active), active)
+
+    def test_failed_or_short_socket_never_retried_during_cleanup(self):
+        self.put()
+        class Sink:
+            writes = 0
+            def write(self, data):
+                self.writes += 1
+                if self.writes == 4:
+                    if mode == 'short': return 0
+                    raise BrokenPipeError('synthetic disconnect')
+                return len(data)
+            def flush(self): pass
+        for mode in ('short', 'broken'):
+            sink = Sink()
+            with self.assertRaises(OSError): batch.write_batch(self.archive, *self.catalog(), sink)
+            self.assertEqual(sink.writes, 4)
+
+    @contextmanager
+    def http(self, handler=Handler):
+        server = BoundedHTTPServer(('127.0.0.1', 0), handler)
+        server.controller = SimpleNamespace(archive=self.archive)
+        server.transcript_api = TranscriptAPI(self.archive, {})
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        def request(path, headers=None):
+            connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=5)
+            try:
+                connection.request('GET', path, headers=headers or {})
+                response = connection.getresponse()
+                return response.status, dict(response.getheaders()), response.read()
+            finally: connection.close()
+        try: yield request, server
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
+
+    def test_http_preview_zip_headers_validation_and_legacy(self):
+        self.put(); self.put('text.txt', kind='transcripts')
+        with self.http() as (request, _):
+            status, headers, raw = request('/api/batch-preview?kind=audio&floor=both')
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw)['expected_files'], 1)
+            self.assertNotIn(b'synthetic', raw)
+            self.assertNotIn(self.temp.name.encode(), raw)
+            status, headers, raw = request('/download-batch.zip?kind=audio&floor=both')
+            self.assertEqual(status, 200)
+            self.assertEqual(headers['Content-Type'], 'application/zip')
+            self.assertEqual(headers['Cache-Control'], 'no-store')
+            self.assertNotIn('Content-Length', headers)
+            self.assertIn('attachment; filename="DJI audio - both -', headers['Content-Disposition'])
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                self.assertTrue(json.loads(z.read('manifest.json'))['complete'])
+            self.assertEqual(request('/api/batch-preview?kind=audio&floor=both&page=2')[0], 400)
+            self.assertEqual(request('/download-batch.zip?kind=all&floor=both')[0], 400)
+            status, _, raw = request('/download-transcripts.zip')
+            self.assertEqual(status, 200)
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                manifest = json.loads(z.read('manifest.json'))
+                self.assertEqual(manifest['format_version'], 1)
+                self.assertEqual(manifest['expected_files'], 1)
+                self.assertNotIn('audio', ' '.join(z.namelist()))
+            self.assertEqual(request('/api/files')[0], 200)
+
+    def test_http_ingress_required_bearer_does_not_grant_batch_access(self):
+        class Denied(Handler):
+            def permitted(self): return False
+        with self.http(Denied) as (request, _):
+            for route in ('/api/batch-preview?kind=audio&floor=both', '/download-batch.zip?kind=transcripts&floor=both'):
+                self.assertEqual(request(route, {'Authorization': 'Bearer SYNTHETIC'})[0], 403)
+            self.assertEqual(request(PREFIX + 'download-batch.zip')[0], 401)
+
+    def test_shared_zip_and_listing_slots_recover_after_failure(self):
+        with self.http() as (request, _):
+            route = '/download-batch.zip?kind=audio&floor=both'
+            with Handler.export_lock:
+                self.assertEqual(request(route)[0], 409)
+                self.assertEqual(request('/download-transcripts.zip')[0], 409)
+                self.assertEqual(request('/api/batch-preview?kind=audio&floor=both')[0], 200)
+            with patch.object(Handler, 'listing_lock', threading.BoundedSemaphore(0)):
+                self.assertEqual(request(route)[0], 503)
+            with patch('server.batch_inventory', side_effect=OverflowError):
+                self.assertEqual(request(route)[0], 503)
+            self.assertEqual(request(route)[0], 200)
+
+    def test_http_partial_stream_failure_not_second_response_and_releases_slot(self):
+        def failed(archive, request, rows, summary, output):
+            output.write(b'partial-zip'); raise BrokenPipeError()
+        with self.http() as (request, _):
+            route = '/download-batch.zip?kind=audio&floor=both'
+            with patch('server.write_batch', failed):
+                status, _, body = request(route)
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b'partial-zip')
+            self.assertEqual(request(route)[0], 200)
+
+    def test_real_loopback_disconnect_releases_slot_promptly(self):
+        path = self.put(data=b'')
+        with path.open('wb') as f: f.truncate(128 * 1024 * 1024)
+        with self.http() as (request, server):
+            sock = socket.create_connection(('127.0.0.1', server.server_port), timeout=3)
+            sock.sendall(b'GET /download-batch.zip?kind=audio&floor=both HTTP/1.0\r\n\r\n')
+            self.assertIn(b'200', sock.recv(512))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)); sock.close()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if Handler.export_lock.acquire(False):
+                    Handler.export_lock.release(); break
+                time.sleep(.01)
+            else: self.fail('Download slot not released after disconnect')
+            self.assertEqual(request('/api/files?page=1')[0], 200)
+
+
+if __name__ == '__main__': unittest.main()

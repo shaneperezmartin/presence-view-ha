@@ -17,11 +17,12 @@ from model_setup import ModelSetup
 from presentation import formatted_chunks
 from file_browser import selection, list_files, open_file, label
 from transcript_export import inventory, write_export
+from batch_export import batch_selection, inventory as batch_inventory, write_batch
 from transcript_api import TranscriptAPI, PREFIX as TRANSCRIPT_PREFIX
 
 BASE = "dji_audio_archive"
 DEVICE = {"identifiers": [BASE], "name": "DJI Audio Archive", "manufacturer": "Local project",
-          "model": "Two-floor audio archive", "sw_version": "0.2.5"}
+          "model": "Two-floor audio archive", "sw_version": "0.2.6"}
 
 
 def discovery():
@@ -217,6 +218,45 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.export_lock.release()
 
+    def batch(self, request, download=False):
+        # Shared slot with the original ZIP route: only one ZIP stream in total.
+        if download and not self.export_lock.acquire(blocking=False):
+            self.send(409, b'<p>Another ZIP download is running. Cancel it in your browser or wait, then preview and try again.</p><p><a href="./">Return to the archive</a></p>', "text/html; charset=utf-8")
+            return
+        started = False
+        try:
+            if not self.listing_lock.acquire(blocking=False):
+                self.send(503, {"error": "Archive listing busy; try again shortly"})
+                return
+            try:
+                rows, summary = batch_inventory(self.server.controller.archive, request)
+            finally:
+                self.listing_lock.release()
+            if not download:
+                self.send(200, summary)
+                return
+            self.connection.settimeout(15)
+            filename = "DJI " + request.kind + " - " + request.floor + " - " + datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_UTC") + ".zip"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            started = True
+            self.close_connection = True
+            write_batch(self.server.controller.archive, request, rows, summary, self.wfile)
+        except Exception:
+            if not started:
+                self.send(503, {"error": "Batch exceeded a safety limit or is unavailable. No files or controls changed; try again later."})
+            # An interrupted ZIP has no valid completion manifest. Never append
+            # another HTTP response or retry a failed socket during cleanup.
+            self.close_connection = True
+        finally:
+            if download:
+                self.export_lock.release()
+
     def download_file(self, kind, floor, name):
         started = False
         try:
@@ -289,6 +329,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.listing_lock.release()
             elif parsed.path == "/api/diagnostics":
                 self.send(200, self.call(self.server.controller.diagnostics(), timeout=20))
+            elif parsed.path in ("/api/batch-preview", "/download-batch.zip"):
+                try:
+                    request = batch_selection(parsed.query)
+                except (ValueError, UnicodeError):
+                    self.send(400, {"error": "Invalid batch type, floor or date range"}); return
+                self.batch(request, download=parsed.path == "/download-batch.zip")
             elif parsed.path == "/download-transcripts.zip":
                 if parsed.query: raise ValueError()
                 self.export_transcripts()
@@ -338,7 +384,7 @@ class Handler(BaseHTTPRequestHandler):
                     return not any(c.state.value.values()) and c.proc is None
                 if not self.call(idle()):
                     self.send(409, {"error": "Turn both controls off before self-test"}); return
-                result = subprocess.run(["python", "-m", "unittest", "-v", "test_archive", "test_model_setup", "test_diarization", "test_presentation", "test_transcript_export", "test_transcript_api", "test_file_browser"], cwd="/app", capture_output=True, text=True, timeout=60)
+                result = subprocess.run(["python", "-m", "unittest", "-v", "test_archive", "test_model_setup", "test_diarization", "test_presentation", "test_transcript_export", "test_transcript_api", "test_file_browser", "test_batch_export"], cwd="/app", capture_output=True, text=True, timeout=60)
                 self.send(200 if result.returncode == 0 else 500, {
                     "success": result.returncode == 0, "synthetic_only": True,
                     "microphone_accessed": False, "result": result.stderr[-14000:]})

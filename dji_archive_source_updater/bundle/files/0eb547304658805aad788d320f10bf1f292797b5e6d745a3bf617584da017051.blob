@@ -1,5 +1,5 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>DJI Audio Archive</title>
-<style>body{font:16px system-ui;background:#101924;color:#e9f0f8;max-width:1000px;margin:auto;padding:24px}h1{font-size:28px;margin-bottom:4px}p{line-height:1.5;color:#b8c7d8}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}section{background:#1b2838;border:1px solid #35465a;border-radius:12px;padding:20px;margin:18px 0}button,select,input{font:inherit;padding:12px 16px;border-radius:8px;border:1px solid #71849a;background:#283b50;color:white;cursor:pointer}button.on{background:#006b58;border-color:#28b998}button:disabled{opacity:.5;cursor:not-allowed}.status{font-size:14px}.badge{color:#7ce8cf;font-weight:650}.warning{color:#ffd48a}a{color:#8fcbff}li{margin:14px 0;overflow-wrap:anywhere}small{display:block;color:#acbbcc;margin-top:5px}footer{margin-top:24px;color:#acbbcc;font-size:14px}h2{font-size:20px}.download-all{display:inline-block;padding:12px 16px;border:1px solid #8fcbff;border-radius:8px;text-decoration:none;background:#283b50}.download-all:focus-visible{outline:3px solid #7ce8cf;outline-offset:3px}.file-controls{display:flex;flex-wrap:wrap;gap:12px;align-items:end}.file-controls label{display:flex;flex-direction:column;gap:6px}.pagination{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{max-width:100%;box-sizing:border-box}button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #7ce8cf;outline-offset:3px}</style>
+<style>body{font:16px system-ui;background:#101924;color:#e9f0f8;max-width:1000px;margin:auto;padding:24px}h1{font-size:28px;margin-bottom:4px}p{line-height:1.5;color:#b8c7d8}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}section{background:#1b2838;border:1px solid #35465a;border-radius:12px;padding:20px;margin:18px 0}button,select,input{font:inherit;padding:12px 16px;border-radius:8px;border:1px solid #71849a;background:#283b50;color:white;cursor:pointer}button.on{background:#006b58;border-color:#28b998}button:disabled{opacity:.5;cursor:not-allowed}.status{font-size:14px}.badge{color:#7ce8cf;font-weight:650}.warning{color:#ffd48a}a{color:#8fcbff}li{margin:14px 0;overflow-wrap:anywhere}small{display:block;color:#acbbcc;margin-top:5px}footer{margin-top:24px;color:#acbbcc;font-size:14px}h2{font-size:20px}.download-all{display:inline-block;padding:12px 16px;border:1px solid #8fcbff;border-radius:8px;text-decoration:none;background:#283b50}.download-all[aria-disabled="true"]{opacity:.5;cursor:not-allowed}.download-all:focus-visible{outline:3px solid #7ce8cf;outline-offset:3px}.file-controls{display:flex;flex-wrap:wrap;gap:12px;align-items:end}.file-controls label{display:flex;flex-direction:column;gap:6px}.pagination{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{max-width:100%;box-sizing:border-box}button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #7ce8cf;outline-offset:3px}</style>
 <h1>DJI Audio Archive</h1><p>Private audio and transcripts, separated by floor.</p>
 <div class="grid"><section><h2>Record audio</h2><p>Ten-minute files · Seven-day retention</p><button id="recording" disabled>Loading…</button><p id="recordingStatus" class="status"></p></section><section><h2>Transcribe speech</h2><p>Ten-minute files · Thirty-day retention</p><button id="transcription" disabled>Loading…</button><p id="transcriptionStatus" class="status"></p></section></div>
 <p>Your selections remain saved through restarts. Switching off stops new capture; queued speech can finish processing afterward.</p>
@@ -15,6 +15,17 @@
 <button id="clearDates" type="button">Clear dates</button><button id="refresh" type="button">Refresh files</button>
 </div>
 <p id="dateHelp">Optional date range uses America/New_York local days. Files are ordered newest first by start time; files without a recognized timestamp use their modified time.</p>
+<section aria-labelledby="batchHeading"><h2 id="batchHeading">Download a batch</h2>
+<p>Use the file type above, then choose the batch scope. A batch includes matching files across every page, not just the page shown below.</p>
+<div class="file-controls">
+<label for="batchFloor">Batch floors<select id="batchFloor"><option value="selected">Selected floor above</option><option value="both">Both floors</option></select></label>
+<label for="batchDates">Batch dates<select id="batchDates"><option value="current">Date range above</option><option value="all">All retained dates</option></select></label>
+<button id="batchPreview" type="button">Preview batch</button><button id="batchCancel" type="button" disabled>Cancel preview</button><button id="batchReset" type="button">Reset preview</button>
+</div>
+<p id="batchStatus" role="status" aria-live="polite">Preview a batch to enable its ZIP download.</p>
+<p id="batchSummary"></p><p id="batchNotices" class="warning"></p>
+<p><a id="batchDownload" class="download-all" target="_blank" rel="noopener" aria-disabled="true" tabindex="-1">Download batch (.zip)</a></p>
+<small>The browser handles the ZIP download and cancellation in its downloads panel. The server allows one ZIP download at a time. Audio ZIPs can run for up to 12 hours; transcript ZIPs for 30 minutes. A stalled connection times out after 15 seconds. A missing manifest.json or broken ZIP means interruption; retry. Preview again before another download. Capture continues; in-progress files are snapshots and may be incomplete. Inventory can change before download: check manifest.json for missing or shortened files. Downloaded copies are outside automatic retention.</small></section>
 <p id="fileStatus" role="status" aria-live="polite"></p><p id="fileScope"></p>
 <nav class="pagination" aria-label="File pages"><button id="firstPage" type="button" disabled>First</button><button id="previousPage" type="button" disabled>Previous</button><span id="pageStatus">Page 0 of 0</span><button id="nextPage" type="button" disabled>Next</button><button id="lastPage" type="button" disabled>Last</button></nav>
 <ul id="files" aria-busy="false"><li>No files loaded.</li></ul>
@@ -86,11 +97,105 @@ async function files(requestedPage=1){
   }
 }
 fileElement('refresh').onclick=()=>files(filePage);
-for(const id of ['floor','kind','from','through'])fileElement(id).onchange=()=>files(1);
-fileElement('clearDates').onclick=()=>{fileElement('from').value='';fileElement('through').value='';return files(1);};
+for(const id of ['floor','kind','from','through'])fileElement(id).onchange=()=>{invalidateBatch();return files(1);};
+fileElement('clearDates').onclick=()=>{invalidateBatch();fileElement('from').value='';fileElement('through').value='';return files(1);};
 for(const [id,page] of [['firstPage',()=>1],['previousPage',()=>filePage-1],['nextPage',()=>filePage+1],['lastPage',()=>filePages]]){
   fileElement(id).onclick=()=>{if(!fileElement(id).disabled)return files(page());};
 }
+// Batch preview and native ZIP navigation never fetch or buffer archive bytes.
+let batchSequence=0,batchAbort=null,batchLoading=false,batchReady=false,batchPreviewQuery=null;
+function disableBatchDownload(){
+  batchReady=false;batchPreviewQuery=null;
+  fileElement('batchDownload').setAttribute('aria-disabled','true');
+  fileElement('batchDownload').tabIndex=-1;
+}
+function invalidateBatch(message='Selection changed. Preview the batch to enable its ZIP download.'){
+  ++batchSequence;
+  if(batchAbort)batchAbort.abort();
+  batchAbort=null;batchLoading=false;
+  disableBatchDownload();
+  if(fileElement('batchDownload').removeAttribute)fileElement('batchDownload').removeAttribute('href');
+  else fileElement('batchDownload').href='';
+  fileElement('batchPreview').disabled=false;fileElement('batchCancel').disabled=true;
+  fileElement('batchSummary').textContent='';fileElement('batchNotices').textContent='';
+  fileElement('batchStatus').textContent=message;
+}
+function batchSelection(){
+  const kind=fileElement('kind').value;
+  const floor=fileElement('batchFloor').value==='both'?'both':fileElement('floor').value;
+  if(!['audio','transcripts'].includes(kind)||!['upstairs','downstairs','both'].includes(floor))throw Error('Choose a valid file type and floor.');
+  const all=fileElement('batchDates').value==='all';
+  const from=all?'':fileElement('from').value,through=all?'':fileElement('through').value;
+  if(!validDate(from)||!validDate(through)||(!all&&(fileElement('from').validity?.badInput||fileElement('through').validity?.badInput)))throw Error('Enter valid dates in the date fields.');
+  if(from&&through&&from>through)throw Error('From must be on or before Through.');
+  const query=new URLSearchParams({kind,floor});
+  if(from)query.set('from',from);if(through)query.set('through',through);
+  return {kind,floor,from,through,query:query.toString()};
+}
+function batchBytes(bytes){
+  if(bytes<1024)return bytes+' bytes';
+  if(bytes<1024*1024)return (bytes/1024).toFixed(1)+' KiB';
+  if(bytes<1024*1024*1024)return (bytes/(1024*1024)).toFixed(1)+' MiB';
+  return (bytes/(1024*1024*1024)).toFixed(1)+' GiB';
+}
+async function previewBatch(){
+  if(batchLoading)return;
+  invalidateBatch('Checking all matching files across every page…');
+  const sequence=batchSequence;
+  batchLoading=true;batchAbort=new AbortController();
+  fileElement('batchPreview').disabled=true;fileElement('batchCancel').disabled=false;
+  try{
+    const selection=batchSelection();
+    const response=await fetch('api/batch-preview?'+selection.query,{signal:batchAbort.signal});
+    if(!response.ok)throw Error(response.status===400?'Check the batch file type, floor, and dates.':'Batch preview could not be loaded. Try Preview batch again.');
+    const result=await response.json();
+    if(sequence!==batchSequence)return;
+    // Also reject a response if a value changed without dispatching a DOM event.
+    if(batchSelection().query!==selection.query){invalidateBatch();return;}
+    if(!Number.isSafeInteger(result.expected_files)||result.expected_files<0||!Number.isFinite(result.estimated_bytes)||result.estimated_bytes<0)throw Error('Invalid batch preview. Try Preview batch again.');
+    const range=selection.from||selection.through
+      ?(selection.from||'earliest retained date')+' through '+(selection.through||'latest retained date')+' (inclusive)'
+      :'all retained dates';
+    fileElement('batchSummary').textContent=result.expected_files+' files · estimated '+batchBytes(result.estimated_bytes)+' uncompressed ('+result.estimated_bytes+' bytes). All pages · '+selection.kind+' · '+(selection.floor==='both'?'both floors':selection.floor)+' · '+range+'. Dates: '+(result.selection?.timezone||'America/New_York')+'.';
+    const notices=[];
+    if(result.active_files)notices.push(result.active_files+' files are still being written; snapshots may be incomplete.');
+    if(result.unfinished_audio_files)notices.push(result.unfinished_audio_files+' unfinished audio files may not play completely.');
+    if(result.unknown_date_files)notices.push(result.unknown_date_files+' retained files have unknown dates.');
+    if(result.excluded_unknown_date_files)notices.push(result.excluded_unknown_date_files+' unknown-date files excluded by the date range.');
+    if(result.unavailable_during_inventory)notices.push(result.unavailable_during_inventory+' files became unavailable during inventory.');
+    notices.push('Files may change or disappear before download; check manifest.json in the ZIP.');
+    fileElement('batchNotices').textContent=notices.join(' ');
+    fileElement('batchStatus').textContent=result.expected_files?'Preview ready. Download includes all matching pages.':'No matching files. Change the scope and preview again.';
+    if(result.expected_files){
+      fileElement('batchDownload').href='download-batch.zip?'+selection.query;
+      fileElement('batchDownload').setAttribute('aria-disabled','false');fileElement('batchDownload').tabIndex=0;
+      batchPreviewQuery=selection.query;batchReady=true;
+    }
+  }catch(error){
+    if(sequence!==batchSequence)return;
+    disableBatchDownload();
+    fileElement('batchStatus').textContent=error.name==='AbortError'?'Preview canceled. Preview again when ready.':error.message||'Batch preview failed. Try again.';
+  }finally{
+    if(sequence===batchSequence){batchLoading=false;batchAbort=null;fileElement('batchPreview').disabled=false;fileElement('batchCancel').disabled=true;}
+  }
+}
+fileElement('batchPreview').onclick=previewBatch;
+fileElement('batchCancel').onclick=()=>invalidateBatch('Preview canceled. Preview again when ready.');
+fileElement('batchReset').onclick=()=>invalidateBatch('Preview reset. Preview again when ready.');
+for(const id of ['batchFloor','batchDates'])fileElement(id).onchange=()=>invalidateBatch();
+for(const id of ['floor','kind','from','through','batchFloor','batchDates'])fileElement(id).oninput=()=>invalidateBatch();
+function startBatchDownload(event){
+  if(event.type==='auxclick'&&event.button!==1)return;
+  if(!batchReady){event.preventDefault();return;}
+  try{
+    if(batchSelection().query!==batchPreviewQuery){event.preventDefault();invalidateBatch();return;}
+  }catch(error){event.preventDefault();invalidateBatch(error.message+' Preview the batch again.');return;}
+  disableBatchDownload();
+  // Keep href intact for this native new-tab navigation; subsequent clicks are blocked.
+  fileElement('batchStatus').textContent='Download requested. Use your browser’s downloads panel to follow or cancel it. The server allows one ZIP at a time. Preview again before another download.';
+}
+fileElement('batchDownload').onclick=startBatchDownload;
+fileElement('batchDownload').onauxclick=startBatchDownload;
 status();files();setInterval(()=>{if(!busy)status();},3000);
 </script></html>
 

@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir torch==2.9.1+cpu torchaudio==2.9.1+cpu torchcodec==0.8.1 --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt && pip check
-COPY archive.py server.py index.html test_archive.py model_setup.py model_worker.py model-setup.html test_model_setup.py diarization.py diarization_worker.py test_diarization.py presentation.py test_presentation.py transcript_export.py test_transcript_export.py transcript_api.py transcript_client.py test_transcript_api.py probe_transcript_api.py file_browser.py test_file_browser.py ./
-RUN python -m unittest -v test_archive test_model_setup test_diarization test_presentation test_transcript_export test_transcript_api test_file_browser
+COPY archive.py server.py index.html test_archive.py model_setup.py model_worker.py model-setup.html test_model_setup.py diarization.py diarization_worker.py test_diarization.py presentation.py test_presentation.py transcript_export.py test_transcript_export.py transcript_api.py transcript_client.py test_transcript_api.py probe_transcript_api.py file_browser.py test_file_browser.py batch_export.py test_batch_export.py ./
+RUN python -m unittest -v test_archive test_model_setup test_diarization test_presentation test_transcript_export test_transcript_api test_file_browser test_batch_export
 RUN PYANNOTE_METRICS_ENABLED=0 OTEL_SDK_DISABLED=true HF_HUB_OFFLINE=1 python -c "from pyannote.audio import Pipeline; import torch; assert torch.version.cuda is None"
 CMD ["python", "/app/server.py"]

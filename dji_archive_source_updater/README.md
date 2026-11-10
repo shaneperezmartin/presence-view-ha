@@ -1,10 +1,10 @@
 # DJI Archive Source Updater
 
-Version 1.1.0. A temporary, manually started Home Assistant app that makes one
+Version 1.1.1. A temporary, manually started Home Assistant app that makes one
 narrow source change, then exits. It does **not** update a running container, stop recording,
 call Home Assistant/Supervisor APIs, create credentials, or access audio/private
 app data. The fixed payload upgrades the original reviewed DJI Audio Archive
-0.2.4 source to 0.2.5. Unrecognized source is refused, including 0.2.3.
+0.2.5 source to 0.2.6. Unrecognized source is refused, including 0.2.4 and earlier versions.
 
 ## Permissions and prerequisites
 
@@ -50,9 +50,9 @@ confinement, missing-file and concurrent-change gates remain unchanged. An unsaf
 or changing file produces a safe refusal instead of a hash report.
 
 Output stays below 8192 bytes. `diagnosis_complete`, `reported_mismatches` and
-`omitted_mismatches` are explicit. The fixed 26-file payload can exceed the
-bound when many files differ: a worst-case 26-mismatch report lists 22 rows and
-explicitly omits 4. An incomplete report is never authority to accept or replace
+`omitted_mismatches` are explicit. The fixed 29-file payload can exceed the
+bound when many files differ: a worst-case 29-mismatch report lists 22 rows and
+explicitly omits 7. An incomplete report is never authority to accept or replace
 any source. The safety gate still checks every file and emits no fingerprint.
 Investigate mismatches; do not substitute observed hashes into the baseline.
 
@@ -173,9 +173,9 @@ hash/mode, baseline manifest, and effective payload. Apply checks them again.
 A cooperative directory lock prevents a second updater. Snapshot comparisons
 before and after each change detect inode/content/metadata changes.
 
-## Exact public or customized 0.2.4 baseline
+## Exact public or customized 0.2.5 baseline
 
-The schema 2 bundle includes the exact reviewed **public** 0.2.4 config as
+The schema 2 bundle includes the exact reviewed **public** 0.2.5 config as
 `baseline-config.blob`. Its hash and mode must match the baseline manifest, and
 its slug/version must match the baseline identity. Both public baseline and
 payload configs must have export disabled and an empty verifier. Public files
@@ -183,10 +183,10 @@ must also be independently reviewed for unrelated private information; these
 export-default checks are not a general secret detector.
 
 With an empty `transcript_export_token_sha256`, only the exact public baseline
-is accepted and export stays disabled. To preserve an already customized 0.2.4
+is accepted and export stays disabled. To preserve an already customized 0.2.5
 baseline, privately supply its **existing SHA-256 export verifier**, exactly 64
 lowercase hexadecimal characters. Never supply or request the usable raw token.
-The helper derives both the expected baseline and the 0.2.5 payload by applying
+The helper derives both the expected baseline and the 0.2.6 payload by applying
 only the original helper's two deterministic assignments in memory:
 
 - `transcript_export_enabled`: `false` to `true`
@@ -206,9 +206,10 @@ accepted source evidence before apply. Public bundle bytes are never modified.
 
 Use the identical verifier and preserved-extra list for inspect, apply and
 rollback, including after reinstalling the helper. Rollback restores the exact
-backed-up 0.2.4 config bytes, not a public placeholder or 0.2.2 config. Different
+backed-up 0.2.5 config bytes, not a public placeholder or any earlier config. Different
 transactions use distinct recovery directories, leaving older backups intact.
-Do not use helper 1.0.4 for this transaction: its baseline is 0.2.2.
+Do not use helper 1.1.0 or any older helper for this transaction: they target
+earlier baselines and cannot roll this update back to 0.2.5.
 
 Installed app options are separate from source defaults. Preserve every existing
 effective option explicitly when the platform submits its update request; never
@@ -217,8 +218,8 @@ replace installed options with this public config's placeholder defaults.
 ## Preflight and rollout
 
 1. Confirm the original app identity is `local_dji_audio_archive` and the running
-   version is 0.2.4. Verify recording/transcription OFF, capture stopped, queue
-   zero and labeling idle. Securely retain the effective options for comparison
+   version is 0.2.5. Verify recording/transcription OFF, capture stopped, queue
+   zero and labeling idle. Securely retain all nine effective options for comparison
    and preserve them explicitly in the platform update. Never log secrets.
 2. Obtain authorization for publication, a protected local backup, temporary
    helper installation with whole-`local_apps` write scope, and the ordinary
@@ -237,21 +238,26 @@ replace installed options with this public config's placeholder defaults.
 6. Require `status: applied` (or verified `already_applied`). Run another
    `inspect` with the same digest and require `status: payload`. Preserve the
    bundle/config hashes for rollback. Do not refresh/build after any refusal.
-7. Refresh the Supervisor app store so it sees source 0.2.5. Use the original
-   app's ordinary **Update** action to 0.2.5. On Supervisor 2026.10.5 this builds
+7. Refresh the Supervisor app store so it sees source 0.2.6. Use the original
+   app's ordinary **Update** action to 0.2.6. On Supervisor 2026.10.5 this builds
    the replacement image first, then stops/restarts the original app, preserving
    identity, options and private `/data`. **Never use Rebuild:** it removes the
    existing image/container before building.
-8. Verify the original app is healthy at 0.2.5, all saved effective options
-   are unchanged, both controls remain OFF, capture is stopped, the queue is
-   empty and labeling is idle. Verify paginated files/date filters and protected
-   downloads without capture, and the unchanged authenticated transcript-only
-   endpoint. Retention cleanup continues; this update cannot restore expired
-   files. Source verification alone proves none of these runtime properties.
-9. Reset updater mode to `inspect` before removing it. Remove the temporary
-   updater once live verification succeeds. Recovery storage remains available.
-   Preserve the existing separate export credential for its existing purpose;
-   this update does not rotate or revoke it.
+8. Verify the original app is healthy at 0.2.6, all nine saved effective
+   options are unchanged, both controls remain OFF, capture is stopped, the
+   queue is empty, labeling is idle, and there is no runtime error. Verify the
+   unchanged authenticated transcript-only endpoint. Source verification alone
+   proves none of these runtime properties.
+9. Reset updater mode to `inspect` and immediately uninstall the temporary
+   helper in the same rollout session after successful runtime verification.
+   Do this **before** waiting for browser/UI QA; never leave its whole-source-tree
+   write access installed for later testing. Verify that it is uninstalled.
+   Recovery storage remains available. Preserve the existing separate export
+   credential; this update does not rotate or revoke it.
+10. After helper removal, verify floor/date-filtered audio and transcript ZIP
+    downloads through authenticated ingress, existing pagination and individual
+    downloads, and denied non-ingress access without enabling capture. Retention
+    cleanup continues; this update cannot restore expired files.
 
 ## Durable backup and interruption behavior
 
@@ -312,14 +318,16 @@ partially written object as a valid backup.
    `baseline`. Changed original files are restored byte-for-byte with original
    modes; added payload files are removed from the app by moving them into
    retained recovery storage; config/version is restored last.
-5. If the running app has **not** been updated, its original 0.2.4 image is still
+5. If the running app has **not** been updated, its original 0.2.5 image is still
    running: source rollback needs no recorder restart.
-6. If 0.2.5 has already been activated, refresh the app store, then use the
-   original app's ordinary versioned **Update to 0.2.4**. Supervisor 2026.10.5
+6. If 0.2.6 has already been activated, refresh the app store, then use the
+   original app's ordinary versioned **Update to 0.2.5**. Supervisor 2026.10.5
    permits a requested version different from the installed version, including
    this downgrade. It builds first and retains the existing image on build
    failure. Do not use Rebuild. Verify original version, health, saved options and both controls OFF.
    Source restoration by itself does **not** switch the running image.
+   After rollback runtime verification, reset the helper to inspect and uninstall
+   it immediately in that same session, before later browser/UI QA.
 7. Retain recovery data until the rollback window closes. This updater never
    automatically deletes backups or retired files. Remove them later only with
    explicit authorization and after verifying no needed edits remain.
@@ -354,7 +362,7 @@ diagnostic pagination, and exact preserve-only extras across interruption.
 `tools/assemble.py` accepts a reviewed baseline hash/mode manifest, the exact
 public baseline config, a public payload source directory, an explicit JSON
 filename whitelist, and an empty output directory. It copies **only** whitelisted public payload bytes. The
-baseline input format is `{"version":"0.2.4","files":{"filename":
+baseline input format is `{"version":"0.2.5","files":{"filename":
 {"sha256":"64-lowercase-hex","mode":420}}}`. It includes only the exact public baseline config template, never live/private
 baseline bytes. Full original source backups are created only locally at apply.
 

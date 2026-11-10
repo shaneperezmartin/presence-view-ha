@@ -1,3 +1,79 @@
+## Version 0.2.6 — selected audio or transcript ZIP batches
+
+Use the Files type, floor and optional dates, then **Download a batch**:
+choose the selected floor or both floors, and the current date range or all
+retained dates. **Preview batch** shows all matching files across every page,
+the selection, estimated uncompressed bytes, unfinished audio and unknown or
+unavailable date counts. **Download batch ZIP** opens separately and leaves the
+browser list in place. To request another download, preview again. Cancel a
+running transfer in the browser's downloads panel; Cancel preview only cancels
+the preview. Changes to inputs invalidate a previous preview. A fresh inventory
+is made when the ZIP starts, so counts and sizes can differ from the preview.
+
+Endpoints (normal authenticated HA ingress only):
+- `GET /api/batch-preview?kind=audio|transcripts&floor=upstairs|downstairs|both`
+- `GET /download-batch.zip?kind=audio|transcripts&floor=upstairs|downstairs|both`
+- Both accept optional `from=YYYY-MM-DD` and `through=YYYY-MM-DD`, inclusive New
+  York local days with DST. Empty date bounds are allowed. Unknown/duplicate
+  parameters, page parameters and arbitrary paths are rejected. Nonstandard
+  valid names use file mtime when no valid UTC filename date exists. Unknown
+  dates are included without date bounds and explicitly counted as excluded
+  when either bound is set. Empty selections produce a valid empty ZIP through
+  the endpoint; the UI disables a zero-file download.
+
+Audio bytes use ZIP_STORED (AAC is not recompressed). Original transcript bytes
+use light DEFLATE compression. ZIP64 is forced for source members. Sanitized
+meaningful names include a globally unique sequence and type/floor folders;
+manifest.json maps each member back to its exact original name and SHA256.
+AAC partial files and audio observed active at inventory/open time are marked
+**UNFINISHED SNAPSHOT** in names and manifest, and may not play completely.
+Transcripts may still need later text or finalized speaker labels.
+
+This is not an atomic backup. Capture and retention continue unchanged. Each
+file is capped at its inventory byte count. Replaced identities before opening
+are skipped; removed/unavailable files, shrinkage, read errors, observed
+size/mtime/ctime/link-count changes and replacement/removal after open are
+reported. A same-inode writer can race copying. SHA256 checks the exported
+bytes, not a stable source snapshot, and changes after each final check cannot
+be detected. `complete: true` means no observed unavailable, skipped, changed,
+truncated or failed entries, not that every source is finalized. A missing
+completion manifest or invalid ZIP means interruption and must not be treated
+as a completed export. New files after inventory wait for another export.
+
+Limits: one ZIP at a time, shared with the compatible old all-transcript ZIP;
+two concurrent inventories shared with file browsing; existing server limit
+of 16 client threads and queue of 16. A batch inventory scans at most 50,000
+entries (including irrelevant/unsafe entries), at most 20,000 retained regular
+files across the selected folders, at most 128 GiB selected source bytes, and
+10 seconds. Limits fail before a ZIP starts rather than silently truncating.
+Audio transfers have a 12-hour deadline; transcript transfers have a 30-minute
+deadline, checked at every read/write and manifest chunk. These limits are
+shown before download. Twelve hours allows a 20-GB batch at roughly 3.7 Mbps
+(plus overhead); slower links may need smaller date ranges. A blocked socket
+write times out within 15 seconds.
+One already-blocked write may run past the overall deadline by at most its
+socket timeout. Failed sockets are latched, so ZIP cleanup never retries them
+and multiplies idle timeouts. Resources and the export slot release on failure.
+I/O uses 64-KiB reads; content and ZIP output are never staged or buffered in
+full. Metadata memory scales only with the bounded inventory, member directory
+and completion report. No locks pause capture, retention or unrelated service.
+
+Normal ingress and descriptor-based directory/file checks restrict this to the
+archive's existing audio/transcripts upstairs/downstairs folders. Symlinks,
+hardlinks and nonregular files are rejected. No public port, extra credentials,
+uploads or broader bearer permissions are added. The separate transcript-only
+bearer API and original `/download-transcripts.zip` remain unchanged, as do
+individual downloads, paging, controls, settings, retention and private options.
+Generic package defaults still disable bearer export and leave its verifier
+empty. Downloaded copies are private and outside automatic retention.
+
+Local verification: aggregate Python tests and both synthetic-DOM Node suites,
+compile checks, unchanged bearer API probe, synthetic streaming/ZIP64/race and
+real loopback disconnect probes. Synthetic DOM checks do not establish actual
+browser layout, assistive-technology behavior or HA ingress/proxy throughput.
+Those require a signed-in post-install browser check; no denied cloud browser
+route is retried. No real captured data is used by these tests.
+
 # DJI Audio Archive
 
 ## Version 0.2.5 - browse the full retained archive
