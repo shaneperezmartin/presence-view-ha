@@ -1,0 +1,24 @@
+{
+  "name": "Background Services Config Inspector",
+  "version": "0.1.0",
+  "slug": "background_services_config_inspector",
+  "description": "Read-only comparison that reports fixed field names and booleans, never private values or hashes",
+  "arch": [
+    "amd64"
+  ],
+  "startup": "once",
+  "boot": "manual",
+  "init": false,
+  "homeassistant_api": false,
+  "hassio_api": false,
+  "host_network": false,
+  "audio": false,
+  "map": [
+    {
+      "type": "local_apps",
+      "read_only": true
+    }
+  ],
+  "options": {},
+  "schema": {}
+}
