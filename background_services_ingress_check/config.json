@@ -1,0 +1,21 @@
+{
+  "name": "Background Services Ingress Check",
+  "version": "0.1.0",
+  "slug": "background_services_ingress_check",
+  "description": "Temporary credential-free ingress route inspection",
+  "arch": [
+    "amd64"
+  ],
+  "startup": "application",
+  "boot": "manual",
+  "init": false,
+  "ingress": true,
+  "ingress_port": 8099,
+  "panel_icon": "mdi:shield-search",
+  "host_network": false,
+  "homeassistant_api": false,
+  "hassio_api": false,
+  "options": {},
+  "schema": {},
+  "panel_admin": true
+}
