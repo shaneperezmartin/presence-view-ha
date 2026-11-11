@@ -1,0 +1,195 @@
+import array
+import asyncio
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import time
+import unittest
+from unittest.mock import patch, AsyncMock
+from archive import Archive, AudioSegment, Controller, DAY, DurableState, FRAME_BYTES, RATE, SEGMENT, SpeechGate, read_event, split_stereo, transcribe, wyoming_event
+from server import discovery
+
+OPTIONS = {"audio_limit_gb":20,"transcript_limit_mb":500,"minimum_free_gb":10,
+           "audio_source":"synthetic-test-do-not-open","whisper_host":"127.0.0.1","whisper_port":1,"language":"en"}
+
+
+class PersistenceTests(unittest.TestCase):
+    def test_all_four_combinations_survive_new_instance(self):
+        with tempfile.TemporaryDirectory() as t:
+            for record in (False, True):
+                for text in (False, True):
+                    p = Path(t) / "controls.json"
+                    state = DurableState(p)
+                    state.set("recording",record); state.set("transcription",text)
+                    self.assertEqual(DurableState(p).value,{"recording":record,"transcription":text})
+
+    def test_corruption_fails_closed_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as t:
+            p=Path(t)/"controls.json";p.write_text("broken")
+            state=DurableState(p)
+            self.assertFalse(any(state.value.values()))
+            with self.assertRaises(RuntimeError): state.set("recording",True)
+            self.assertEqual(p.read_text(),"broken")
+
+    def test_failed_commit_does_not_acknowledge_new_state(self):
+        with tempfile.TemporaryDirectory() as t:
+            state=DurableState(Path(t)/"controls.json");state.set("recording",False)
+            with patch("archive.os.replace",side_effect=OSError("synthetic disk failure")):
+                with self.assertRaises(OSError):state.set("recording",True)
+            self.assertFalse(state.value["recording"])
+            self.assertFalse(DurableState(state.path).value["recording"])
+
+    def test_invalid_control_values_rejected(self):
+        with tempfile.TemporaryDirectory() as t:
+            state=DurableState(Path(t)/"controls.json")
+            with self.assertRaises(ValueError):state.set("recording","ON")
+            with self.assertRaises(ValueError):state.set("other",True)
+
+
+class StorageTests(unittest.TestCase):
+    def test_retention_boundaries_and_active_protection(self):
+        with tempfile.TemporaryDirectory() as t:
+            a=Archive(t);now=time.time()
+            expired=a.new("audio","upstairs",now,".aac");expired.write_bytes(b"old")
+            os.utime(expired,(now-7*DAY,now-7*DAY))
+            recent=a.new("transcripts","downstairs",now,".txt");recent.write_text("synthetic")
+            os.utime(recent,(now-29*DAY,now-29*DAY))
+            active=a.new("transcripts","upstairs",now,".txt");active.write_text("active")
+            os.utime(active,(now-31*DAY,now-31*DAY));a.active[active]+=1
+            self.assertEqual(a.cleanup(now),1)
+            self.assertTrue(recent.exists());self.assertTrue(active.exists())
+            a.active[active]-=1;self.assertEqual(a.cleanup(now),1)
+
+    def test_disk_cap_deletes_oldest_closed_file_only(self):
+        with tempfile.TemporaryDirectory() as t:
+            a=Archive(t,audio_limit=10);now=time.time()
+            old=a.new("audio","upstairs",now,".aac");old.write_bytes(b"12345678");os.utime(old,(now-10,now-10))
+            new=a.new("audio","downstairs",now,".aac.part");new.write_bytes(b"12345678");a.active[new]+=1
+            a.cleanup(now);self.assertFalse(old.exists());self.assertTrue(new.exists())
+
+    def test_path_traversal_and_unrelated_files_untouched(self):
+        with tempfile.TemporaryDirectory() as t:
+            a=Archive(t)
+            for name in ("../private","..\\private","/etc/passwd"):
+                with self.assertRaises(ValueError):a.safe("audio","upstairs",name)
+            unrelated=a.root/"audio"/"upstairs"/"keep.json";unrelated.write_text("safe")
+            os.utime(unrelated,(0,0));a.cleanup();self.assertTrue(unrelated.exists())
+
+    def test_symlink_not_followed(self):
+        with tempfile.TemporaryDirectory() as t:
+            a=Archive(Path(t)/"archive");outside=Path(t)/"outside";outside.write_text("keep")
+            link=a.root/"audio"/"upstairs"/"linked.aac"
+            try:link.symlink_to(outside)
+            except OSError:self.skipTest("Symlink creation unavailable on this host")
+            a.cleanup(time.time()+100*DAY);self.assertTrue(outside.exists());self.assertTrue(link.is_symlink())
+
+
+class ChannelTests(unittest.TestCase):
+    def test_left_upstairs_right_downstairs_with_signed_samples(self):
+        source=array.array("h",[100,-200,300,-400,500,-600]).tobytes()
+        left,right=split_stereo(source)
+        self.assertEqual(list(array.array("h",left)),[100,300,500])
+        self.assertEqual(list(array.array("h",right)),[-200,-400,-600])
+        with self.assertRaises(ValueError):split_stereo(b"123")
+
+    def test_silence_never_becomes_transcription_job(self):
+        class Silent:
+            def is_speech(self,*args):return False
+        gate=SpeechGate(Silent())
+        for i in range(400):self.assertIsNone(gate.feed(b"\0"*FRAME_BYTES,i*.02))
+        self.assertIsNone(gate.finish(8))
+
+    def test_speech_gate_flushes_bounded_passages(self):
+        class Voice:
+            def is_speech(self,*args):return True
+        gate=SpeechGate(Voice());jobs=[]
+        for i in range(1600):
+            job=gate.feed(b"\1\0"*320,i*.02)
+            if job:jobs.append(job)
+        self.assertGreaterEqual(len(jobs),2)
+        self.assertTrue(all(len(job[0])<=RATE*2*15 for job in jobs))
+
+    def test_native_controls_require_confirmed_state_and_not_retained_commands(self):
+        configs=discovery()
+        self.assertEqual(len(configs),5)
+        for topic,c in configs.items():
+            if "/switch/" in topic:
+                self.assertFalse(c["optimistic"]);self.assertFalse(c["retain"])
+                self.assertIn("state_topic",c)
+
+
+class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_controller_idle_never_opens_microphone(self):
+        with tempfile.TemporaryDirectory() as t:
+            c=Controller(t,OPTIONS)
+            with patch("archive.asyncio.create_subprocess_exec",new_callable=AsyncMock) as launch:
+                task=asyncio.create_task(c.capture_loop());await asyncio.sleep(.05)
+                c.running=False;await task
+                launch.assert_not_called()
+            self.assertEqual(c.archive.files("audio"),[])
+            self.assertEqual(c.archive.files("transcripts"),[])
+
+    async def test_controller_control_persistence_without_capture(self):
+        with tempfile.TemporaryDirectory() as t:
+            c=Controller(t,OPTIONS)
+            await c.set_control("recording",True);await c.set_control("transcription",True)
+            restarted=Controller(t,OPTIONS)
+            self.assertEqual(restarted.state.value,{"recording":True,"transcription":True})
+            await restarted.set_control("recording",False);await restarted.set_control("transcription",False)
+            self.assertFalse(any(Controller(t,OPTIONS).state.value.values()))
+
+    async def test_ten_minute_transcript_boundary_separates_floors(self):
+        with tempfile.TemporaryDirectory() as t:
+            c=Controller(t,OPTIONS);silence=b"\0"*FRAME_BYTES
+            c.feed_text((silence,silence),time.time());prior=c.text_paths.copy()
+            self.assertEqual(prior[0].parent.name,"upstairs");self.assertEqual(prior[1].parent.name,"downstairs")
+            c.text_samples=RATE*SEGMENT
+            c.feed_text((silence,silence),time.time()+600)
+            self.assertNotEqual(c.text_paths,prior)
+            self.assertEqual(c.queue.qsize(),0)
+            c.close_text(time.time()+601)
+
+    async def test_wyoming_protocol_uses_local_stt_only(self):
+        received=[];sent_pcm=b"\1\0"*320
+        async def server(reader,writer):
+            try:
+                while True:
+                    e=await read_event(reader);received.append(e["type"])
+                    if e["type"]=="audio-stop":break
+                await wyoming_event(writer,"transcript",{"text":"Synthetic test words"})
+            finally:
+                writer.close();await writer.wait_closed()
+        s=await asyncio.start_server(server,"127.0.0.1",0)
+        async with s:
+            port=s.sockets[0].getsockname()[1]
+            text=await transcribe(sent_pcm,"127.0.0.1",port,"en")
+        self.assertEqual(text,"Synthetic test words")
+        self.assertEqual(received,["transcribe","audio-start","audio-chunk","audio-stop"])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),"FFmpeg available in app image")
+    async def test_audio_files_encode_and_rotate_without_microphone(self):
+        with tempfile.TemporaryDirectory() as t:
+            archive=Archive(t)
+            for floor in ("upstairs","downstairs"):
+                encoder=AudioSegment(archive,floor)
+                tone=array.array("h",[int(5000*math.sin(2*math.pi*440*i/RATE)) for i in range(320)]).tobytes()
+                for i in range(50):await encoder.feed(tone,time.time())
+                encoder.samples=RATE*SEGMENT
+                for i in range(50):await encoder.feed(tone,time.time()+600)
+                await encoder.close()
+            paths=archive.files("audio")
+            self.assertEqual(len(paths),4)
+            for p in paths:
+                self.assertEqual(p.suffix,".aac");self.assertGreater(p.stat().st_size,0)
+                result=subprocess.run(["ffprobe","-v","error","-show_streams","-of","json",str(p)],capture_output=True,text=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                stream=json.loads(result.stdout)["streams"][0]
+                self.assertEqual(stream["channels"],1);self.assertEqual(stream["codec_name"],"aac")
+                self.assertEqual(int(stream["sample_rate"]),RATE)
+
+
+if __name__=="__main__":unittest.main()

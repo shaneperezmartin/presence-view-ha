@@ -1,0 +1,526 @@
+"""HA ingress UI and native MQTT controls. No audio/text in logs or MQTT."""
+from __future__ import annotations
+import asyncio
+import functools
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from archive import Controller, FLOORS
+from model_setup import ModelSetup
+from presentation import formatted_chunks
+from file_browser import selection, list_files, open_file, label
+from transcript_export import inventory, write_export
+from batch_export import batch_selection, inventory as batch_inventory, write_batch
+from transcript_api import TranscriptAPI, PREFIX as TRANSCRIPT_PREFIX
+from app_auth import AppAuth
+from enrollment import Enrollment
+
+BASE = "dji_audio_archive"
+DEVICE = {"identifiers": [BASE], "name": "Background Services", "manufacturer": "Local project",
+          "model": "Two-floor audio archive", "sw_version": "0.2.7"}
+
+
+def discovery():
+    common = {"device": DEVICE, "availability_topic": BASE + "/availability"}
+    out = {}
+    for key, title in (("recording", "Record audio"), ("transcription", "Transcribe speech")):
+        out[f"homeassistant/switch/{BASE}/{key}/config"] = {
+            **common, "name": title, "unique_id": BASE + "_" + key,
+            "command_topic": f"{BASE}/{key}/set", "state_topic": f"{BASE}/{key}/state",
+            "optimistic": False, "retain": False, "qos": 1,
+            "icon": "mdi:record-rec" if key == "recording" else "mdi:text-box-outline"}
+        out[f"homeassistant/binary_sensor/{BASE}/{key}_active/config"] = {
+            **common, "name": title + " active", "unique_id": BASE + "_" + key + "_active",
+            "state_topic": f"{BASE}/{key}/active", "icon": "mdi:microphone"}
+    out[f"homeassistant/sensor/{BASE}/status/config"] = {
+        **common, "name": "Status", "unique_id": BASE + "_status",
+        "state_topic": BASE + "/status", "json_attributes_topic": BASE + "/details",
+        "icon": "mdi:information-outline"}
+    return out
+
+
+def mqtt_service():
+    token = os.environ["SUPERVISOR_TOKEN"]
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request("http://supervisor/services/mqtt", headers={"Authorization": "Bearer " + token})
+    with opener.open(request, timeout=10) as response:
+        body = json.load(response)
+    if body.get("result") != "ok": raise RuntimeError("MQTT service unavailable")
+    return body["data"]
+
+
+class MQTTBridge:
+    def __init__(self, controller, loop):
+        self.controller, self.loop, self.client = controller, loop, None
+        self.connected = False
+
+    async def start(self):
+        import paho.mqtt.client as mqtt
+        while self.controller.running:
+            try:
+                service = await asyncio.to_thread(mqtt_service)
+                client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=BASE, clean_session=True)
+                client.username_pw_set(service["username"], service["password"])
+                client.will_set(BASE + "/availability", "offline", qos=1, retain=True)
+                client.reconnect_delay_set(min_delay=2, max_delay=30)
+                client.max_queued_messages_set(100)
+                client.on_connect = self.connect
+                client.on_disconnect = self.disconnect
+                client.on_message = self.message
+                self.client = client
+                client.connect_async(service["host"], service["port"], keepalive=20)
+                client.loop_start()
+                return
+            except Exception:
+                self.controller.error = "MQTT connection not ready; local controls remain available"
+                await asyncio.sleep(10)
+
+    def connect(self, client, userdata, flags, reason, properties):
+        if reason.is_failure: return
+        self.connected = True
+        client.subscribe([(f"{BASE}/+/set", 1), ("homeassistant/status", 0)])
+        self.loop.call_soon_threadsafe(self.announce)
+
+    def disconnect(self, client, userdata, flags, reason, properties):
+        self.connected = False
+
+    def announce(self):
+        if not self.client or not self.connected: return
+        for topic, data in discovery().items():
+            self.client.publish(topic, json.dumps(data), qos=1, retain=True)
+        self.publish()
+        self.client.publish(BASE + "/availability", "online", qos=1, retain=True)
+
+    def message(self, client, userdata, msg):
+        if msg.topic == "homeassistant/status" and msg.payload == b"online":
+            self.loop.call_soon_threadsafe(self.announce)
+            return
+        if msg.retain: return  # Never replay old retained control commands.
+        parts = msg.topic.split("/")
+        if len(parts) == 3 and parts[0] == BASE and parts[1] in ("recording", "transcription") and parts[2] == "set" and msg.payload in (b"ON", b"OFF"):
+            future = asyncio.run_coroutine_threadsafe(self.controller.set_control(parts[1], msg.payload == b"ON"), self.loop)
+            def done(f):
+                try: f.result()
+                except Exception:
+                    self.loop.call_soon_threadsafe(self.control_failed)
+            future.add_done_callback(done)
+
+    def control_failed(self):
+        self.controller.error = "Control could not be saved; requested change was not accepted"
+        self.publish()
+
+    def publish(self):
+        if not self.client or not self.connected: return
+        status = self.controller.status()
+        for key in ("recording", "transcription"):
+            self.client.publish(f"{BASE}/{key}/state", "ON" if status[key] else "OFF", qos=1, retain=True)
+            self.client.publish(f"{BASE}/{key}/active", "ON" if status[key + "_active"] else "OFF", qos=1, retain=True)
+        label = "Attention needed" if status["error"] else (
+            "Recording and transcribing" if status["recording_active"] and status["transcription_active"] else
+            "Recording" if status["recording_active"] else "Transcribing" if status["transcription_active"] else
+            "Finishing transcripts" if status["queue_length"] else
+            "Waiting for capture" if status["recording"] or status["transcription"] else "Idle")
+        self.client.publish(BASE + "/status", label, qos=1, retain=True)
+        self.client.publish(BASE + "/details", json.dumps(status), qos=1, retain=True)
+
+    def stop(self):
+        if self.client:
+            if self.connected:
+                self.client.publish(BASE + "/availability", "offline", qos=1, retain=True).wait_for_publish(timeout=3)
+            self.client.disconnect(); self.client.loop_stop()
+
+
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Bound slow clients before parsing headers or starting worker threads."""
+    daemon_threads = True
+    request_queue_size = 16
+
+    def __init__(self, *args, **kwargs):
+        self.request_slots = threading.BoundedSemaphore(16)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        request.settimeout(15)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_slots.release()
+
+    def handle_error(self, request, client_address):
+        pass  # Never log request/credential/source details from failures.
+
+
+class SessionWriter:
+    """Abort future response chunks after logout/expiry; sent bytes cannot be revoked."""
+    def __init__(self, stream, auth, handler):
+        self.stream, self.auth, self.handler = stream, auth, handler
+    def write(self, data):
+        if not self.auth.authenticated(self.handler, touch=False):
+            raise ConnectionResetError("Session expired")
+        return self.stream.write(data)
+    def __getattr__(self, name): return getattr(self.stream, name)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "DJIArchive"
+    export_lock = threading.BoundedSemaphore(1)
+    listing_lock = threading.BoundedSemaphore(2)
+    def log_message(self, *args): pass
+
+    def permitted(self):
+        # The port is unpublished. HA ingress is the sole browser entry point.
+        return self.client_address[0] in ("172.30.32.2", "127.0.0.1", "::1")
+
+    def send(self, status, payload, kind="application/json"):
+        if not isinstance(payload, bytes): payload = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'self'")
+        self.end_headers(); self.wfile.write(payload)
+
+    def auth_gate(self):
+        auth = getattr(self.server, "app_auth", None)
+        if auth is None:
+            self.send(503, {"error": "App lock unavailable"}); return False
+        path = urllib.parse.urlsplit(self.path).path
+        if path.startswith(TRANSCRIPT_PREFIX):
+            self.send(403, {"error": "Machine transcript API disabled by independent app lock"}); return False
+        if self.command == "GET" and self.path == "/health":
+            if not self.permitted(): self.send(403, {"error": "Forbidden"})
+            else: self.send(200, {"ok": True})
+            return False
+        prefix = auth.context(self)
+        if not prefix:
+            self.send(403, {"error": "Use verified HTTPS Home Assistant ingress"}); return False
+        if self.command == "GET" and self.path == "/auth/setup-time":
+            self.send(200, {"expires": int(time.time()) + 1800}); return False
+        if self.command == "GET" and self.path == "/setup":
+            self.send(200, Path("/app/setup.html").read_bytes(), "text/html; charset=utf-8"); return False
+        if self.command == "GET" and self.path == "/login":
+            self.send(200, Path("/app/login.html").read_bytes(), "text/html; charset=utf-8"); return False
+        if self.command == "POST" and self.path in ("/auth/login", "/auth/logout", "/auth/enroll"):
+            if (self.headers.get_all("X-Archive-Control", []) != ["1"] or
+                self.headers.get_all("Content-Type", []) != ["application/json"] or
+                self.headers.get("Transfer-Encoding") is not None):
+                self.send(403, {"error": "Invalid authentication request"}); return False
+            try:
+                lengths = self.headers.get_all("Content-Length", [])
+                if len(lengths) != 1: raise ValueError()
+                size = int(lengths[0])
+                if not 0 < size <= (8192 if self.path == "/auth/enroll" else 4096): raise ValueError()
+                body = json.loads(self.rfile.read(size))
+                if self.path == "/auth/enroll":
+                    if not isinstance(body, dict) or set(body) != {"code", "password", "confirmation"}: raise ValueError()
+                    enrollment = getattr(self.server, "enrollment", None)
+                    status = enrollment.enroll(body["code"], body["password"], body["confirmation"]) if enrollment else 503
+                    self.send(status, {"ok": True} if status == 201 else {"error": "Unable to enroll"})
+                    return False
+                if self.path == "/auth/login":
+                    if not isinstance(body, dict) or set(body) != {"password"}: raise ValueError()
+                    status, token = auth.login(body["password"], prefix)
+                    payload = b'{"ok":true}' if status == 200 else b'{"error":"Unable to unlock"}'
+                    self.send_response(status)
+                    if token: self.send_header("Set-Cookie", auth.cookie(token, prefix))
+                else:
+                    if body != {}: raise ValueError()
+                    auth.logout(self)
+                    payload = b'{"ok":true}'
+                    self.send_response(200)
+                    self.send_header("Set-Cookie", auth.cookie("", prefix, clear=True))
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers(); self.wfile.write(payload)
+            except (ValueError, TypeError): self.send(400, {"error": "Invalid authentication request"})
+            return False
+        if not auth.authenticated(self, touch=path not in ("/api/status", "/api/diarization", "/api/model-setup")):
+            if self.command == "GET" and path in ("/", "/index.html", "/model-setup"):
+                self.send_response(303); self.send_header("Location", prefix + "/login")
+                self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", "0"); self.end_headers()
+            else: self.send(401, {"error": "Unlock Background Services"})
+            return False
+        self.wfile = SessionWriter(self.wfile, auth, self)
+        return True
+
+    def call(self, coro, timeout=15):
+        return asyncio.run_coroutine_threadsafe(coro, self.server.loop).result(timeout)
+
+    def export_transcripts(self):
+        if not self.export_lock.acquire(blocking=False):
+            self.send(409, b'<p>Another transcript download is running. Try again when it finishes.</p><p><a href="./">Return to the archive</a></p>', "text/html; charset=utf-8")
+            return
+        started = False
+        try:
+            archive = self.server.controller.archive
+            paths = inventory(archive)
+            self.connection.settimeout(30)  # Release the export slot if a client stops reading.
+            filename = "DJI transcripts - " + datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_UTC") + ".zip"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # HTTP/1.0 close-delimited streaming: no full ZIP buffering/temporary file.
+            self.send_header("Connection", "close")
+            self.end_headers()
+            started = True
+            self.close_connection = True
+            write_export(archive, paths, self.wfile)
+        except Exception:
+            if not started:
+                self.send(503, b'<p>The transcript export could not start. No files or controls were changed. Try again later.</p><p><a href="./">Return to the archive</a></p>', "text/html; charset=utf-8")
+            # Never append a second HTTP response to a partly sent ZIP. A missing
+            # manifest or invalid ZIP tells the recipient to retry the download.
+            self.close_connection = True
+        finally:
+            self.export_lock.release()
+
+    def batch(self, request, download=False):
+        # Shared slot with the original ZIP route: only one ZIP stream in total.
+        if download and not self.export_lock.acquire(blocking=False):
+            self.send(409, b'<p>Another ZIP download is running. Cancel it in your browser or wait, then preview and try again.</p><p><a href="./">Return to the archive</a></p>', "text/html; charset=utf-8")
+            return
+        started = False
+        try:
+            if not self.listing_lock.acquire(blocking=False):
+                self.send(503, {"error": "Archive listing busy; try again shortly"})
+                return
+            try:
+                rows, summary = batch_inventory(self.server.controller.archive, request)
+            finally:
+                self.listing_lock.release()
+            if not download:
+                self.send(200, summary)
+                return
+            self.connection.settimeout(15)
+            filename = "DJI " + request.kind + " - " + request.floor + " - " + datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_UTC") + ".zip"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            started = True
+            self.close_connection = True
+            write_batch(self.server.controller.archive, request, rows, summary, self.wfile)
+        except Exception:
+            if not started:
+                self.send(503, {"error": "Batch exceeded a safety limit or is unavailable. No files or controls changed; try again later."})
+            # An interrupted ZIP has no valid completion manifest. Never append
+            # another HTTP response or retry a failed socket during cleanup.
+            self.close_connection = True
+        finally:
+            if download:
+                self.export_lock.release()
+
+    def download_file(self, kind, floor, name):
+        started = False
+        try:
+            with open_file(self.server.controller.archive, kind, floor, name) as (source, snapshot):
+                size = snapshot.st_size
+                output_size = size
+                if kind == "transcripts":
+                    output_size = sum(len(chunk) for chunk in formatted_chunks(source, size))
+                    source.seek(0)
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/aac" if kind == "audio" else "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(output_size))
+                self.send_header("Content-Disposition", f'attachment; filename="{label(name, floor, kind)}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                started = True
+                if kind == "transcripts":
+                    for chunk in formatted_chunks(source, size):
+                        self.wfile.write(chunk)
+                    return
+                remaining = size
+                while remaining:
+                    data = source.read(min(65536, remaining))
+                    if not data:
+                        break
+                    self.wfile.write(data)
+                    remaining -= len(data)
+        except (OSError, ValueError):
+            if not started:
+                self.send(404, b'<p>This archive file is no longer available. It may have expired or been replaced while processing.</p><p>Return to the archive tab and refresh the file list.</p>', "text/html; charset=utf-8")
+            else:
+                # A disconnected client or shortened file must not receive a
+                # second HTTP response in the partial download.
+                self.close_connection = True
+
+    def do_GET(self):
+        if not self.auth_gate(): return
+        if not self.permitted(): self.send(403, {"error": "Use Home Assistant ingress"}); return
+        parsed = urllib.parse.urlsplit(self.path)
+        try:
+            if parsed.path in ("/", "/index.html"):
+                self.send(200, Path("/app/index.html").read_bytes(), "text/html; charset=utf-8")
+            elif parsed.path == "/model-setup":
+                self.send(200, Path("/app/model-setup.html").read_bytes(), "text/html; charset=utf-8")
+            elif parsed.path == "/api/model-setup":
+                self.send(200, self.server.models.status())
+            elif parsed.path == "/api/diarization":
+                async def speaker_status(): return self.server.controller.diarizer.status()
+                self.send(200, self.call(speaker_status()))
+            elif parsed.path == "/api/status":
+                async def snapshot(): return self.server.controller.status()
+                self.send(200, self.call(snapshot()))
+            elif parsed.path == "/api/files":
+                try:
+                    request = selection(parsed.query)
+                except (ValueError, UnicodeError):
+                    self.send(400, {"error": "Invalid file filters or pagination"}); return
+                if not self.listing_lock.acquire(blocking=False):
+                    self.send(503, {"error": "File listing busy; refresh shortly"}); return
+                try:
+                    # Directory I/O runs on this bounded HTTP worker, never the
+                    # capture/control event loop. Do not mutate archive state.
+                    result = list_files(self.server.controller.archive, request)
+                    self.send(200, result)
+                except (OverflowError, TimeoutError):
+                    self.send(503, {"error": "File listing exceeded its safety limit; no partial list was returned"})
+                finally:
+                    self.listing_lock.release()
+            elif parsed.path == "/api/diagnostics":
+                self.send(200, self.call(self.server.controller.diagnostics(), timeout=20))
+            elif parsed.path in ("/api/batch-preview", "/download-batch.zip"):
+                try:
+                    request = batch_selection(parsed.query)
+                except (ValueError, UnicodeError):
+                    self.send(400, {"error": "Invalid batch type, floor or date range"}); return
+                self.batch(request, download=parsed.path == "/download-batch.zip")
+            elif parsed.path == "/download-transcripts.zip":
+                if parsed.query: raise ValueError()
+                self.export_transcripts()
+            elif parsed.path.startswith("/download/"):
+                pieces = parsed.path.split("/")
+                if len(pieces) != 5: raise ValueError()
+                _, _, kind, floor, name = pieces
+                self.download_file(kind, floor, urllib.parse.unquote(name))
+            else: self.send(404, {"error": "Not found"})
+        except (ValueError, FileNotFoundError): self.send(404, {"error": "Not found"})
+        except (BrokenPipeError, ConnectionResetError): pass
+        except Exception: self.send(503, {"error": "Request unavailable"})
+
+    def do_POST(self):
+        if not self.auth_gate(): return
+        if not self.permitted(): self.send(403, {"error": "Use Home Assistant ingress"}); return
+        # Non-simple header + JSON prevents cross-origin form CSRF. No CORS enabled.
+        if self.headers.get("X-Archive-Control") != "1" or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+            self.send(403, {"error": "Missing control header"}); return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= 1024: raise ValueError()
+            body = json.loads(self.rfile.read(size))
+            if self.path == "/api/control":
+                self.send(200, self.call(self.server.controller.set_control(body["control"], body["enabled"])))
+            elif self.path == "/api/model-setup":
+                async def idle_for_setup():
+                    c = self.server.controller
+                    return not any(c.state.value.values()) and c.proc is None
+                token = body.pop("token", None)
+                try:
+                    if body: raise ValueError()
+                    self.send(202, self.server.models.start(token, self.call(idle_for_setup()),
+                        self.server.controller.options["minimum_free_gb"]))
+                except RuntimeError:
+                    self.send(409, {"error": "Setup not started; check capture controls and download status"})
+                finally:
+                    token = None
+            elif self.path == "/api/diarization-test" and body == {"test": "synthetic"}:
+                async def speaker_test(): return self.server.controller.diarizer.start_test()
+                try: self.send(202, self.call(speaker_test()))
+                except RuntimeError: self.send(409, {"error": "Capture and processing must be idle"})
+            elif self.path == "/api/self-test" and body == {"test": "synthetic"}:
+                async def idle():
+                    c = self.server.controller
+                    return not any(c.state.value.values()) and c.proc is None
+                if not self.call(idle()):
+                    self.send(409, {"error": "Turn both controls off before self-test"}); return
+                result = subprocess.run(["python", "-m", "unittest", "-v", "test_archive", "test_model_setup", "test_diarization", "test_presentation", "test_transcript_export", "test_transcript_api", "test_file_browser", "test_batch_export"], cwd="/app", capture_output=True, text=True, timeout=60)
+                self.send(200 if result.returncode == 0 else 500, {
+                    "success": result.returncode == 0, "synthetic_only": True,
+                    "microphone_accessed": False, "result": result.stderr[-14000:]})
+            else: self.send(404, {"error": "Not found"})
+        except (ValueError, KeyError, TypeError): self.send(400, {"error": "Invalid control request"})
+        except Exception: self.send(503, {"error": "Change was not confirmed; read back controls"})
+
+
+async def main():
+    os.umask(0o077)
+    options = json.loads(Path("/data/options.json").read_text())
+    controller = Controller("/data", options)
+    loop = asyncio.get_running_loop()
+    bridge = MQTTBridge(controller, loop)
+    controller.on_change = bridge.publish
+    server = BoundedHTTPServer(("0.0.0.0", 8099), Handler)
+    server.daemon_threads = True
+    server.controller, server.loop = controller, loop
+    server.models = ModelSetup("/data")
+    server.transcript_api = TranscriptAPI(controller.archive, options)
+    server.app_auth = AppAuth(options.get("app_password_verifier", ""),
+                              https_hostname=options.get("app_https_hostname", ""),
+                              ingress_core_peer=options.get("app_ingress_core_peer", ""))
+    server.enrollment = Enrollment(server.app_auth, "/data/app-password.json",
+                                   options.get("app_enrollment_approval", ""),
+                                   configured_verifier=options.get("app_password_verifier", ""))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT): loop.add_signal_handler(sig, stop.set)
+    tasks = [asyncio.create_task(f()) for f in (controller.capture_loop, controller.speech_loop, controller.maintenance_loop, bridge.start, controller.diarizer.loop)]
+    def worker_done(task):
+        if not task.cancelled() and task.exception() is not None:
+            controller.error = "A worker failed; restarting the app is required"
+            stop.set()
+    for task in tasks: task.add_done_callback(worker_done)
+    print("Background Services ready. Capture uses saved controls; audio/text logging disabled.", flush=True)
+    await stop.wait()
+    controller.running = False
+    await asyncio.to_thread(server.models.stop)
+    if controller.proc and controller.proc.returncode is None: controller.proc.terminate()
+    try: await asyncio.wait_for(asyncio.shield(tasks[0]), 15)
+    except (asyncio.TimeoutError, asyncio.CancelledError): pass
+    # Finish bounded queued work on graceful stop without altering persistent controls.
+    try: await asyncio.wait_for(controller.queue.join(), 20)
+    except asyncio.TimeoutError: pass
+    for task in tasks: task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if controller.diarizer.test_task:
+        controller.diarizer.test_task.cancel()
+        await asyncio.gather(controller.diarizer.test_task, return_exceptions=True)
+    while not controller.diarizer.queue.empty():
+        path, pcm, start = controller.diarizer.queue.get_nowait()
+        controller.archive.append(path, '\n[Speaker labels unavailable: app stopped before processing]\n')
+        controller.archive.active[path] -= 1
+        controller.diarizer.queue.task_done()
+        pcm = None
+    await asyncio.to_thread(bridge.stop)
+    await asyncio.to_thread(server.shutdown)
+    server.server_close()
+
+
+if __name__ == "__main__": asyncio.run(main())
+

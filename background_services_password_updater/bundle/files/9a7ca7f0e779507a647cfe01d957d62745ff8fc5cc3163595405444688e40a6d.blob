@@ -1,0 +1,49 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Set up Background Services</title><style>body{font:17px system-ui;max-width:38rem;margin:3vh auto;padding:1rem;background:#101820;color:#eef}input,button{font:inherit;padding:.7rem;margin:.5rem 0;width:100%;box-sizing:border-box}a{color:#9df}label{display:block}#message{min-height:3em}</style></head><body>
+<h1>Set up your app password</h1><p>Use your verified HTTPS Home Assistant address while connected to Tailscale. This setup requires an administrator and cannot replace an existing password.</p>
+<h2>1. Make a private setup code</h2><p>Save the code in your password manager before leaving this page. It is separate from your new password. It expires after 30 minutes. Nothing is saved in browser storage. Never send the code or password in chat.</p><button id="generate" type="button">Generate setup code</button>
+<label>Private setup code <input id="generated" readonly autocomplete="off" spellcheck="false" aria-label="Private setup code"></label>
+<h2>2. Approve in Home Assistant</h2><p>Copy the approval value below. In Home Assistant, open Settings → Apps → Background Services → Configuration. Paste it into app_enrollment_approval. Leave app_password_verifier blank. Save and restart only this app, then reopen this setup page. Only an administrator who controls this configuration can approve enrollment.</p>
+<label>Approval value (copy only this into Configuration) <input id="approval" readonly autocomplete="off" spellcheck="false"></label>
+<p>Do not change the HTTPS hostname or ingress peer options. If the approval expires or the private code is lost, generate a new pair and repeat the approval step.</p>
+<h2>3. Create your password</h2><form id="enroll">
+<label>Saved private setup code <input id="code" type="password" autocomplete="off" minlength="64" maxlength="64" required></label>
+<label>New app password <input id="password" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label>
+<label>Confirm new app password <input id="confirmation" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label>
+<button id="submit">Create app password</button></form><p id="message" role="status"></p><p>After success, clear app_enrollment_approval in Configuration. Your password is stored only as a salted verifier. Keep your new password in your password manager.</p><p><a href="login">Back to unlock</a></p>
+<script>
+'use strict';
+const el=id=>document.getElementById(id);
+let generation=0;
+function clearSecrets(){generation++;for(const id of ['generated','approval','code','password','confirmation'])el(id).value='';}
+window.addEventListener('pagehide',clearSecrets);
+window.addEventListener('pageshow',event=>{if(event.persisted){clearSecrets();el('generate').disabled=false;el('submit').disabled=false;}});
+el('generate').addEventListener('click',async()=>{
+  const current=++generation;el('generate').disabled=true;el('message').textContent='';
+  try{
+    if(!window.isSecureContext||!crypto.subtle)throw Error('HTTPS required');
+    const response=await fetch('auth/setup-time',{cache:'no-store'});
+    if(!response.ok)throw Error('Time unavailable');
+    const {expires}=await response.json();
+    if(!Number.isSafeInteger(expires))throw Error('Invalid time');
+    const code=Array.from(crypto.getRandomValues(new Uint8Array(32)),v=>v.toString(16).padStart(2,'0')).join('');
+    const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(code));
+    if(current!==generation)return;
+    el('generated').value=code;
+    el('approval').value=Array.from(new Uint8Array(digest),v=>v.toString(16).padStart(2,'0')).join('')+':'+expires;
+    el('message').textContent='Save the private code, then copy the approval value into Home Assistant Configuration.';
+  }catch(e){if(current===generation){clearSecrets();el('message').textContent='Unable to generate a code. Use the verified HTTPS address.';}}
+  finally{el('generate').disabled=false;}
+});
+el('enroll').addEventListener('submit',async event=>{
+  event.preventDefault();if(el('submit').disabled)return;
+  if(el('password').value!==el('confirmation').value){el('message').textContent='Passwords do not match.';return;}
+  el('submit').disabled=true;el('message').textContent='Creating password…';
+  const body=JSON.stringify({code:el('code').value,password:el('password').value,confirmation:el('confirmation').value});
+  clearSecrets();
+  try{
+    const response=await fetch('auth/enroll',{method:'POST',headers:{'Content-Type':'application/json','X-Archive-Control':'1'},body,cache:'no-store'});
+    el('message').textContent=response.status===201?'Password created. Clear the approval option, then use Back to unlock.':response.status===409?'A password is already configured or requires administrator recovery. Try Back to unlock.':response.status===429?'Too many attempts. Wait five minutes.':response.status===503?'Setup could not be confirmed. Try unlocking first; do not reset or delete anything. Ask your administrator if needed.':'Setup not accepted. Check the saved code, approval expiry, matching passwords and secure connection.';
+  }catch(e){el('message').textContent='Connection interrupted. Password creation may have succeeded. Try Back to unlock before attempting setup again.';}
+  finally{el('submit').disabled=false;}
+});
+</script></body></html>

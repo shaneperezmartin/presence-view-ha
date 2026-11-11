@@ -1,0 +1,21 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Speaker label setup</title>
+<style>*{box-sizing:border-box}body{font:16px system-ui;background:#101924;color:#e9f0f8;max-width:780px;margin:auto;padding:24px}h1{font-size:28px}p{line-height:1.5;color:#b8c7d8}section{background:#1b2838;border:1px solid #35465a;border-radius:12px;padding:22px;margin:20px 0}input,button{font:inherit;border:1px solid #71849a;border-radius:8px;padding:12px;background:#283b50;color:white}input{width:100%;margin:10px 0 18px}button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}a{color:#8fcbff}.status{color:#7ce8cf;font-weight:600}.error{color:#ffd48a}label{display:block}small{color:#b8c7d8}</style>
+<h1>Speaker label setup</h1><p>Download Community-1 for local speaker labeling on this Home Assistant computer.</p>
+<section><form id="setup" autocomplete="off"><label for="token">Hugging Face download token</label><input id="token" name="download_token" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" required placeholder="Paste your token here"><button id="download" type="submit">Download model</button></form>
+<p>Your token is sent to Hugging Face to download this model. It is held in memory for the download and is not saved in app settings or logs. This page clears the field when you submit it.</p>
+<small>Use the token with read access to pyannote/speaker-diarization-community-1. No cloud audio processing is enabled.</small></section>
+<section><div id="status" class="status">Checking setup…</div><p id="error" class="error"></p><p id="progress"></p></section>
+<p>Downloading does not turn on recording or transcription. Return to the audio archive to run the local model check before your first speaker-label test.</p>
+<p><a href="./">Back to audio archive</a></p>
+<script>
+let sending=false,lastPhase='',requestError='';
+async function refresh(){try{const r=await fetch('api/model-setup');if(!r.ok)throw Error();const s=await r.json();lastPhase=s.phase;if(s.phase==='downloading'||s.phase==='downloaded')requestError='';document.getElementById('status').textContent=s.message;document.getElementById('error').textContent=s.error||requestError;document.getElementById('progress').textContent=s.phase==='not_started'?'Both capture controls must be off during setup.':s.completed_files+' of '+s.total_files+' files verified.';const locked=sending||s.phase==='downloading'||s.phase==='downloaded';document.getElementById('download').disabled=locked;document.getElementById('token').disabled=locked;}catch(e){document.getElementById('status').textContent='Setup status unavailable';document.getElementById('download').disabled=true;}}
+document.getElementById('setup').onsubmit=async e=>{e.preventDefault();if(sending||lastPhase==='downloading'||lastPhase==='downloaded')return;sending=true;requestError='';const input=document.getElementById('token');let value=input.value.trim();input.value='';document.getElementById('download').disabled=true;try{const r=await fetch('api/model-setup',{method:'POST',headers:{'Content-Type':'application/json','X-Archive-Control':'1'},body:JSON.stringify({token:value})});value='';if(!r.ok)throw Error();}catch(e){requestError='The request was not confirmed. Check status before submitting again.';}finally{value='';sending=false;await refresh();}};
+window.addEventListener('pagehide',()=>{document.getElementById('token').value='';});refresh();setInterval(refresh,2500);
+</script>
+<button id="app-lock" type="button">Lock app</button><script>
+document.querySelector('#app-lock').onclick=async()=>{try{const r=await fetch('auth/logout',{method:'POST',headers:{'Content-Type':'application/json','X-Archive-Control':'1'},body:'{}'});if(!r.ok)throw Error();location.replace('login')}catch(e){alert('Lock could not be confirmed. Close this tab and retry.')}};
+const originalFetch=window.fetch;window.fetch=async(...args)=>{const r=await originalFetch(...args);if(r.status===401){document.body.replaceChildren();location.replace('login')}return r};
+window.addEventListener('pageshow',e=>{if(e.persisted)location.reload()});
+</script>
+</html>

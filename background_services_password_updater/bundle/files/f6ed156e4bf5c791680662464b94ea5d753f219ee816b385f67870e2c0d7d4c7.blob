@@ -1,0 +1,31 @@
+# Independent password lock
+
+This unreleased version requires a separate app password even when Home Assistant is already signed in. All archive web content, controls, models and downloads are gated server-side. The legacy machine transcript bearer API is disabled. Native Home Assistant MQTT recording/transcription controls remain independent and unchanged; this is not a lock against administrators of Home Assistant or the host.
+
+## Secure route prerequisite
+
+An administrator must verify HTTPS access and the complete ingress route before filling app_https_hostname and app_ingress_core_peer. Both default empty and access stays locked. The implemented route is Tailscale Serve HTTPS to HA through 127.0.0.1, then HA Core and Supervisor ingress. It requires a pinned .ts.net hostname, exact selected forwarding headers, actual ingress socket peer 172.30.32.2 and the verified three-address chain [tailnet client,127.0.0.1,Core peer]. Do not infer the Core peer from generic examples or accept untrusted forwarded headers alone. Trusted host-network processes remain inside this network trust boundary; this is not cryptographic TLS attestation. Other HTTPS architectures require a separately reviewed configuration/design.
+
+Tailscale-encrypted HTTP is still HTTP to the browser. It cannot satisfy this app's Secure cookie or pinned HTTPS gate. Do not bypass certificate warnings or enable public Funnel as a workaround.
+
+## First-time setup on a phone
+
+1. Connect Tailscale and open HA using its verified HTTPS address. After signing in, open this app and select Set up on this phone.
+2. Generate a random setup code. Save it privately in a password manager before leaving the page. It is not stored in browser storage, cookies, logs or URLs. Do not send it in chat.
+3. Copy only the separate approval hash:expiry value into this app's administrator-only Configuration field app_enrollment_approval. Leave app_password_verifier blank. Save and restart this app during an appropriate maintenance window.
+4. Return to setup, enter the saved code and a new unique password twice. The fixed server-derived approval expires after 30 minutes and restarting does not extend it. Existing passwords cannot be overwritten through this page; first visitors cannot claim an unapproved app. The hash alone cannot enroll.
+5. After success, clear the approval field and use Back to unlock. No session is issued automatically. Do not put the password or setup code in an HA option.
+
+Use 12–256 characters; browser limits may count emoji differently from server Unicode codepoints. Lost or expired setup codes require a fresh pair and new administrator approval. If the connection is interrupted during submission, try unlocking first: creation may have completed.
+
+## Storage and recovery
+
+The server stores only a random-salt scrypt verifier (N32768,r8,p1) in /data/app-password.json, created exclusively with mode 0600 and synced to disk. This private file and backups permit offline guessing and must not be published. A present file takes precedence over the legacy app_password_verifier option. Corrupt, unreadable, symlinked or nonregular file state fails closed and never falls back to the old option. If no file exists, any nonempty legacy option blocks first-time web enrollment.
+
+The private interactive password_admin.py tool is a legacy alternative before file enrollment, not a way to replace a file-enrolled password. There is no unauthenticated reset, delete or overwrite endpoint. Recovery requires a separately authorized administrator procedure: stop the app, preserve a private copy of verifier/options, establish the failure state, deliberately move the old verifier aside and clear the legacy verifier, then approve a fresh setup. Do not delete archive data or grant broad host/API access for recovery by default. Restoring a verifier backup restores its old password.
+
+## Sessions and limits
+
+Sessions use random 256-bit tokens in Secure,HttpOnly,SameSite=Strict cookies scoped and bound to the HA ingress path. They expire after 15 minutes idle or 8 hours total; status polling does not extend idle time. Restart clears sessions. Login attempts have a shared five-per-five-minute budget, and at most 16 sessions are held. Logout revokes the session and stops later application stream writes; bytes already sent and downloaded files cannot be revoked. No secrets are stored in browser local/session storage.
+
+Before production acceptance, validate the actual HTTPS proxy route, phone setup, Secure cookies, wrong-password limits, logout, expiration, back navigation and interrupted downloads. Synthetic test results do not prove a live deployment is secure. Preserve existing data/options and validate a bounded rollback before updating an existing installation.

@@ -1,0 +1,185 @@
+"""Read-only, bounded-memory ZIP export. No captured data is logged or staged."""
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+import re
+import stat
+import time
+import zipfile
+
+from archive import FLOORS
+from presentation import friendly_name
+
+CHUNK_BYTES = 65536
+MAX_FILES = 50000  # Bound the ZIP directory and manifest, never silently truncate.
+MAX_SECONDS = 1800
+
+README = """DJI Audio Archive - all saved transcripts
+
+The upstairs and downstairs folders contain byte-for-byte snapshots of saved
+.txt files, including any unfinished files. Original words, speaker labels and
+UTC metadata are unchanged. Individual web downloads still offer readable
+local dates inside the text. ZIP filenames use New York local dates and times.
+
+All files found at the start are attempted, not just the newest 100 per floor.
+Each file is limited to its size when opened. Later appends, new files and later
+speaker-label replacements are not included. Recording is not paused.
+Retention is not paused: files removed before opening are reported as skipped.
+Files shortened during copying are reported as truncated. Download again for
+later text or finalized speaker labels.
+
+Check manifest.json: complete must be true, with skipped_files and
+truncated_files both zero. A missing manifest or damaged ZIP means the download
+was interrupted; retry. The manifest maps each ZIP entry to its original name,
+snapshot byte count and SHA256. An empty archive has zero transcript entries.
+This ZIP contains private text. Downloaded copies are outside app retention.
+"""
+
+
+@contextmanager
+def transcript_directory(archive, floor):
+    """Pin every directory component before either listing or opening files."""
+    if floor not in FLOORS:
+        raise ValueError("Invalid floor")
+    descriptors = []
+    try:
+        if os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW"):
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            directory = os.open(archive.root, directory_flags)
+            descriptors.append(directory)
+            for component in ("transcripts", floor):
+                directory = os.open(component, directory_flags, dir_fd=directory)
+                descriptors.append(directory)
+            yield directory
+        else:
+            # Portable synthetic tests only; production is the Linux app image.
+            folder = archive.root / "transcripts" / floor
+            if any(p.is_symlink() for p in (archive.root, folder.parent, folder)) or not folder.resolve().is_relative_to(archive.root):
+                raise ValueError("Invalid archive directory")
+            yield folder
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def inventory(archive):
+    """List only regular, non-link text files; leave controls/retention alone."""
+    paths = []
+    for floor in FLOORS:
+        with transcript_directory(archive, floor) as directory, os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name.endswith(".txt") and entry.is_file(follow_symlinks=False):
+                    if len(paths) >= MAX_FILES:
+                        raise OverflowError("Too many files for one export")
+                    paths.append((floor, entry.name))
+    return sorted(paths)
+
+
+@contextmanager
+def open_transcript(archive, floor, name):
+    """Open one confined regular file; Linux dirfds reject directory swaps."""
+    path = archive.safe("transcripts", floor, name)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    with transcript_directory(archive, floor) as directory:
+        fd = (os.open(name, flags | os.O_NOFOLLOW, dir_fd=directory)
+              if isinstance(directory, int) else os.open(path, flags))
+        try:
+            source = os.fdopen(fd, "rb")
+        except Exception:
+            os.close(fd)
+            raise
+        with source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("Not a regular transcript")
+            if os.name == "nt":
+                after = archive.safe("transcripts", floor, name).stat()
+                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                    raise ValueError("Transcript changed while opening")
+            yield source, before
+
+
+class StreamSink:
+    """Expose only streaming writes, even when tests use a seekable buffer."""
+    def __init__(self, output, deadline):
+        self.output, self.deadline = output, deadline
+        self.failed = False
+
+    def write(self, data):
+        if self.failed:
+            raise OSError("Export stream already failed")
+        try:
+            if time.monotonic() > self.deadline:
+                raise TimeoutError("Export deadline exceeded")
+            written = self.output.write(data)
+            if written != len(data):
+                raise OSError("Incomplete export write")
+            return len(data)
+        except Exception:
+            # zipfile finalizes member/footer data during exception cleanup.
+            # Do not retry a failed socket and multiply the idle timeout.
+            self.failed = True
+            raise
+
+    def flush(self):
+        if not self.failed:
+            self.output.flush()
+
+
+def write_export(archive, paths, output):
+    """Stream a ZIP64 archive without holding a transcript/ZIP in memory."""
+    report = {"format_version": 1, "export_started_utc": datetime.now(timezone.utc).isoformat(),
+              "expected_files": len(paths), "exported_files": 0, "skipped_files": 0,
+              "truncated_files": 0, "complete": False, "files": []}
+    sink = StreamSink(output, time.monotonic() + MAX_SECONDS)
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=1, allowZip64=True) as bundle:
+        bundle.writestr("README.txt", README)
+        for floor in FLOORS:
+            bundle.writestr(floor + "/", b"")
+        for index, (floor, name) in enumerate(paths, 1):
+            record = {"floor": floor, "source_name": name}
+            report["files"].append(record)
+            try:
+                opened = open_transcript(archive, floor, name)
+                source, snapshot = opened.__enter__()
+            except (OSError, ValueError):
+                record["status"] = "skipped_unavailable"
+                report["skipped_files"] += 1
+                continue
+            try:
+                # Prefix ensures distinct, Windows-safe names even for same-second files.
+                try:
+                    label = friendly_name(name, floor, "transcripts")
+                except (ValueError, OverflowError):
+                    label = name  # A malformed date must not hide saved text.
+                label = re.sub(r"[^a-zA-Z0-9._ -]", "_", label)[:180]
+                member = f"{floor}/{index:05d} - {label}"
+                if not member.endswith(".txt"):
+                    member += ".txt"
+                remaining = snapshot.st_size
+                digest = hashlib.sha256()
+                record.update({"zip_entry": member, "snapshot_bytes": remaining,
+                               "snapshot_mtime_ns": snapshot.st_mtime_ns})
+                with bundle.open(member, "w", force_zip64=True) as target:
+                    while remaining:
+                        data = source.read(min(CHUNK_BYTES, remaining))
+                        if not data:
+                            break
+                        target.write(data)
+                        digest.update(data)
+                        remaining -= len(data)
+                record.update({"exported_bytes": snapshot.st_size - remaining,
+                               "sha256": digest.hexdigest(),
+                               "status": "truncated" if remaining else "exported"})
+                report["exported_files"] += 1
+                report["truncated_files"] += bool(remaining)
+            finally:
+                opened.__exit__(None, None, None)
+        report["complete"] = report["skipped_files"] == report["truncated_files"] == 0
+        with bundle.open("manifest.json", "w", force_zip64=True) as target:
+            for chunk in json.JSONEncoder(ensure_ascii=True, indent=2).iterencode(report):
+                target.write(chunk.encode("utf-8"))
+    return report

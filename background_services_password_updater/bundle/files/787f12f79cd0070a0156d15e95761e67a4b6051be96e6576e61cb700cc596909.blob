@@ -1,0 +1,165 @@
+"""One-time model download. Credentials travel only through an anonymous pipe."""
+from __future__ import annotations
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+REPO = "pyannote/speaker-diarization-community-1"
+REVISION = "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee"
+FILES = {
+    "README.md": (9978, "git", "8356d6634d7b1074581dd36e2225887ec809326e"),
+    "config.yaml": (444, "git", "4022db43960736338378fdb6b5a85cfdae198910"),
+    "embedding/README.md": (938, "git", "d71f943e00016652680bef1e6c49fbc842e0d4c4"),
+    "embedding/pytorch_model.bin": (26646242, "sha256", "6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929"),
+    "plda/README.md": (220, "git", "5c01ad2e673203fe32a82d7a140eb817db9930b7"),
+    "plda/plda.npz": (133852, "sha256", "9b77bcd840692710dd3496f62ecfeed8d8e5f002fd991b785079b244eab7d255"),
+    "plda/xvec_transform.npz": (134376, "sha256", "325f1ce8e48f7e55e9c8aa47e05d2766b7c48c4b25b8de8dd751e7a4cc5fbe8f"),
+    "segmentation/pytorch_model.bin": (5906507, "sha256", "7ad24338d844fb95985486eb1a464e32d229f6d7a03c9abe60f978bacf3f816e"),
+}
+PHASES = {"not_started", "downloading", "downloaded", "failed", "interrupted"}
+MESSAGES = {
+    "not_started": "Ready for your private download token.",
+    "downloading": "Downloading and verifying the local model.",
+    "downloaded": "Model files downloaded and verified. Return to the audio archive for local speaker-label status.",
+    "failed": "Download did not complete. Re-enter a valid token with read access to Community-1.",
+    "interrupted": "Download was interrupted. Re-enter the token to resume.",
+}
+SAFE_ERRORS = {
+    "access": "Hugging Face denied access. Check the token's model permission and your accepted model access.",
+    "storage": "Download paused because the free-space reserve would be exceeded.",
+    "integrity": "A downloaded file did not match the pinned release. No model was activated.",
+    "network": "The download could not finish. Check connectivity and retry; your token was not saved.",
+}
+
+def write_state(root, phase, completed=0, error=None):
+    value = {"phase": phase, "completed_files": completed, "total_files": len(FILES),
+             "repo": REPO, "revision": REVISION, "message": MESSAGES[phase],
+             "error": SAFE_ERRORS.get(error), "updated_at": int(time.time()),
+             "token_saved": False, "speaker_labels_active": False}
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = root / "setup-state.new"
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle)
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(tmp, root / "setup-state.json")
+    return value
+
+def valid_token(value):
+    return isinstance(value, str) and re.fullmatch(r"hf_[A-Za-z0-9]{20,256}", value) is not None
+
+def verify_file(path, spec):
+    path = Path(path)
+    size, kind, expected = spec
+    if path.is_symlink() or not path.is_file() or path.stat().st_size != size:
+        raise ValueError("integrity")
+    digest = hashlib.sha256() if kind == "sha256" else hashlib.sha1()
+    if kind == "git": digest.update(f"blob {size}\0".encode())
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024): digest.update(chunk)
+    if digest.hexdigest() != expected: raise ValueError("integrity")
+
+def download(root, token, fetch, minimum_free_bytes=10_000_000_000):
+    root = Path(root)
+    if root.is_symlink(): raise ValueError("integrity")
+    model = root / "community-1"
+    if model.is_symlink(): raise ValueError("integrity")
+    model.mkdir(parents=True, exist_ok=True)
+    write_state(root, "downloading")
+    try:
+        for count, (name, spec) in enumerate(FILES.items(), 1):
+            if shutil.disk_usage(root).free < minimum_free_bytes + 50_000_000:
+                raise OSError("storage")
+            target = model / name
+            if target.is_symlink() or target.parent.is_symlink():
+                raise ValueError("integrity")
+            received = Path(fetch(repo_id=REPO, filename=name, revision=REVISION,
+                                  local_dir=str(model), token=token))
+            if received.resolve() != target.resolve(): raise ValueError("integrity")
+            verify_file(target, spec)
+            write_state(root, "downloading", count)
+        write_state(root, "downloaded", len(FILES))
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        reason = "access" if status in (401, 403) else (
+            "integrity" if isinstance(exc, ValueError) else
+            "storage" if type(exc) is OSError and exc.args == ("storage",) else "network")
+        write_state(root, "failed", error=reason)
+        return False
+    return True
+
+class ModelSetup:
+    def __init__(self, data):
+        self.root = Path(data) / "models"
+        if self.root.is_symlink(): raise ValueError("Invalid model directory")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.proc = None
+        initial = self.status()
+        if initial["phase"] == "downloading":
+            write_state(self.root, "interrupted")
+
+    def status(self):
+        try:
+            stored = json.loads((self.root / "setup-state.json").read_text())
+            phase = stored["phase"]
+            if phase not in PHASES: raise ValueError()
+            completed = stored.get("completed_files", 0)
+            if type(completed) is not int or not 0 <= completed <= len(FILES): raise ValueError()
+            error = stored.get("error")
+            # Only allow fixed status strings out of this API, never arbitrary exception text.
+            result = {"phase": phase, "completed_files": completed, "total_files": len(FILES),
+                      "repo": REPO, "revision": REVISION, "message": MESSAGES[phase],
+                      "error": error if error in SAFE_ERRORS.values() else None,
+                      "token_saved": False, "speaker_labels_active": False}
+            if phase == "downloading" and self.proc and self.proc.poll() is not None:
+                return write_state(self.root, "interrupted", completed)
+            return result
+        except (OSError, ValueError, KeyError, TypeError):
+            return {"phase": "not_started", "completed_files": 0, "total_files": len(FILES),
+                    "repo": REPO, "revision": REVISION, "message": MESSAGES["not_started"],
+                    "error": None, "token_saved": False, "speaker_labels_active": False}
+
+    def start(self, token, idle, minimum_free_gb=10):
+        if not valid_token(token): raise ValueError("Invalid token format")
+        if not idle: raise RuntimeError("Turn both capture controls off before model setup")
+        with self.lock:
+            if self.proc and self.proc.poll() is None: raise RuntimeError("Download already in progress")
+            if self.status()["phase"] == "downloaded": raise RuntimeError("Model already downloaded")
+            env = os.environ.copy()
+            for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "SUPERVISOR_TOKEN", "HASSIO_TOKEN"):
+                env.pop(key, None)
+            env.update(HF_HOME=str(self.root / ".hub"), HF_TOKEN_PATH=os.devnull,
+                       HF_HUB_DISABLE_IMPLICIT_TOKEN="1", HF_HUB_DISABLE_TELEMETRY="1",
+                       HF_HUB_DISABLE_PROGRESS_BARS="1", HF_HUB_DISABLE_XET="1", DO_NOT_TRACK="1",
+                       HF_HUB_ETAG_TIMEOUT="15", HF_HUB_DOWNLOAD_TIMEOUT="30")
+            write_state(self.root, "downloading")
+            try:
+                self.proc = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).with_name("model_worker.py")),
+                     str(self.root), str(minimum_free_gb)],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                self.proc.stdin.write(token.encode("ascii") + b"\n")
+                self.proc.stdin.close()
+            except Exception:
+                if self.proc and self.proc.poll() is None: self.proc.terminate()
+                write_state(self.root, "failed", error="network")
+                raise RuntimeError("Download could not be started") from None
+            return self.status()
+
+    def stop(self):
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+                try: self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill(); self.proc.wait()
+                write_state(self.root, "interrupted")
+

@@ -1,0 +1,265 @@
+"""Ingress-only bounded batch snapshots. Never stage ZIPs or mutate archive data."""
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+import re
+import stat
+import time
+from urllib.parse import parse_qs, urlencode
+import zipfile
+
+from archive import FLOORS
+from file_browser import archive_directory, open_file, valid_name, timestamp, label, selection
+from presentation import LOCAL
+from transcript_export import StreamSink
+
+CHUNK_BYTES = 65536
+MAX_FILES = 20000
+MAX_ENTRIES = 50000  # Includes irrelevant names and links, not just matches.
+MAX_INVENTORY_SECONDS = 10
+MAX_SECONDS = 1800  # Transcript deadline.
+MAX_AUDIO_SECONDS = 12 * 3600
+MAX_BYTES = 128 * 1024**3
+
+README = """DJI Audio Archive - selected batch
+
+These are byte-for-byte source snapshots, not an atomic archive backup.
+The selection covers every matching file across all pages and the selected
+floors. Inclusive dates use America/New_York; nonstandard names use mtime.
+Unknown dates are included only without date filters. Preview counts and
+uncompressed bytes are estimates: a fresh inventory is made at download time.
+
+Audio is stored without recompression. Text is compressed without changing
+words, speaker labels or original UTC metadata. AAC files marked UNFINISHED
+SNAPSHOT may be incomplete or unplayable and are not finalized recordings.
+Active transcripts may lack final text and speaker labels. Recording and
+retention are not paused. New files after inventory are not included.
+
+Each member is limited to its inventory byte count. Appends are not included.
+Replaced files before opening are skipped; shortening, observed changes,
+removal and read failures are reported in manifest.json. Same-inode writes
+can race copying: a hash verifies the exported bytes, not an atomic source
+snapshot. Changes after the final per-file check cannot be detected.
+
+Check manifest.json: complete means no observed unavailable, skipped, changed,
+truncated or failed entries, NOT that files are finalized or the archive is
+atomic. A missing manifest or broken ZIP means download interruption: retry.
+Original names, date sources, byte counts and SHA256 are mapped there.
+This download is private. Downloaded copies are outside automatic retention.
+"""
+
+
+@dataclass(frozen=True)
+class BatchSelection:
+    kind: str
+    floor: str
+    start: object = None
+    through: object = None
+
+    def summary(self):
+        return {"kind": self.kind, "floor": self.floor,
+                "from": self.start.isoformat() if self.start else None,
+                "through": self.through.isoformat() if self.through else None,
+                "timezone": "America/New_York"}
+
+
+def batch_selection(query):
+    if len(query) > 2048:
+        raise ValueError("Invalid batch filters")
+    values = parse_qs(query, keep_blank_values=True, strict_parsing=True,
+                      max_num_fields=4, encoding="utf-8", errors="strict")
+    if set(values) - {"kind", "floor", "from", "through"} or any(len(v) != 1 for v in values.values()):
+        raise ValueError("Invalid batch filters")
+    args = {k: v[0] for k, v in values.items()}
+    if args.get("kind") not in ("audio", "transcripts") or args.get("floor") not in (*FLOORS, "both"):
+        raise ValueError("Choose a batch type and floor")
+    # Reuse the exact reviewed date parsing and inclusive New York semantics.
+    floor = args["floor"]
+    args["floor"] = FLOORS[0] if floor == "both" else floor
+    parsed = selection(urlencode(args))
+    return BatchSelection(parsed.kind, floor, parsed.start, parsed.through)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def check_deadline(deadline):
+    if time.monotonic() > deadline:
+        raise TimeoutError("Batch deadline exceeded")
+
+
+def identity(snapshot):
+    return snapshot.st_dev, snapshot.st_ino
+
+
+def revision(snapshot):
+    return snapshot.st_size, snapshot.st_mtime_ns, snapshot.st_ctime_ns, snapshot.st_nlink
+
+
+def inventory(archive, request):
+    """Bounded descriptor-confined metadata only; never return a partial catalogue."""
+    deadline = time.monotonic() + MAX_INVENTORY_SECONDS
+    summary = {"selection": request.summary(), "inventory_started_utc": utc_now(),
+               "expected_files": 0, "estimated_bytes": 0, "active_files": 0,
+               "unfinished_audio_files": 0, "retained_files": 0,
+               "unknown_date_files": 0, "excluded_unknown_date_files": 0,
+               "unavailable_during_inventory": 0, "counts_by_floor": {}}
+    rows, inspected = [], 0
+    for floor in FLOORS if request.floor == "both" else (request.floor,):
+        summary["counts_by_floor"][floor] = 0
+        with archive_directory(archive, request.kind, floor) as directory, os.scandir(directory) as entries:
+            for entry in entries:
+                check_deadline(deadline)
+                inspected += 1
+                if inspected > MAX_ENTRIES:
+                    raise OverflowError("Too many archive directory entries")
+                if not valid_name(request.kind, entry.name):
+                    continue
+                try:
+                    before = entry.stat(follow_symlinks=False)
+                except OSError:
+                    summary["unavailable_during_inventory"] += 1
+                    continue
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                    continue
+                summary["retained_files"] += 1
+                if summary["retained_files"] > MAX_FILES:
+                    raise OverflowError("Too many retained files")
+                started, date_source = timestamp(entry.name, before)
+                local_day = started.astimezone(LOCAL).date() if started else None
+                if started is None:
+                    summary["unknown_date_files"] += 1
+                    if request.start or request.through:
+                        summary["excluded_unknown_date_files"] += 1
+                if request.start and (local_day is None or local_day < request.start):
+                    continue
+                if request.through and (local_day is None or local_day > request.through):
+                    continue
+                active = archive.active.get(archive.root / request.kind / floor / entry.name, 0) > 0
+                unfinished = request.kind == "audio" and (entry.name.endswith(".aac.part") or active)
+                rows.append({"floor": floor, "name": entry.name, "stat": before,
+                             "started": started.isoformat() if started else None,
+                             "date_source": date_source, "active": active, "unfinished": unfinished})
+                summary["estimated_bytes"] += before.st_size
+                if summary["estimated_bytes"] > MAX_BYTES:
+                    raise OverflowError("Batch byte limit exceeded")
+                summary["active_files"] += bool(active)
+                summary["unfinished_audio_files"] += bool(unfinished)
+                summary["counts_by_floor"][floor] += 1
+    check_deadline(deadline)
+    rows.sort(key=lambda row: (row["floor"], row["name"]))
+    summary.update(expected_files=len(rows), inventory_finished_utc=utc_now())
+    return rows, summary
+
+
+def member_name(kind, row, index, unfinished):
+    safe = re.sub(r"[^a-zA-Z0-9._ -]", "_", label(row["name"], row["floor"], kind))[:160].rstrip(" .")
+    suffix = ".aac" if kind == "audio" else ".txt"
+    if safe.endswith(suffix):
+        safe = safe[:-len(suffix)]
+    marker = " - UNFINISHED SNAPSHOT" if unfinished else ""
+    # Global index prevents collisions after sanitation, truncation or casefolding.
+    return f'{kind}/{row["floor"]}/{index:05d} - {safe}{marker}{suffix}'
+
+
+def current_stat(archive, kind, floor, name):
+    with archive_directory(archive, kind, floor) as directory:
+        return (os.stat(name, dir_fd=directory, follow_symlinks=False) if isinstance(directory, int)
+                else os.stat(directory / name, follow_symlinks=False))
+
+
+def write_batch(archive, request, rows, summary, output):
+    """64 KiB reads, ZIP64 members, bounded metadata, no archive-sized buffer."""
+    deadline = time.monotonic() + (MAX_AUDIO_SECONDS if request.kind == "audio" else MAX_SECONDS)
+    sink = StreamSink(output, deadline)
+    report = {**summary, "format_version": 2, "atomic_snapshot": False,
+              "export_started_utc": utc_now(), "exported_files": 0,
+              "skipped_files": 0, "truncated_files": 0, "changed_files": 0,
+              "read_error_files": 0, "complete": False, "files": []}
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=1, allowZip64=True) as bundle:
+        bundle.writestr("README.txt", README)
+        for index, row in enumerate(rows, 1):
+            check_deadline(deadline)
+            before, floor, name = row["stat"], row["floor"], row["name"]
+            record = {"floor": floor, "source_name": name, "date_source": row["date_source"],
+                      "started_utc": row["started"], "inventory_bytes": before.st_size,
+                      "inventory_mtime_ns": before.st_mtime_ns,
+                      "active_at_inventory": row["active"], "changes": []}
+            report["files"].append(record)
+            try:
+                opened = open_file(archive, request.kind, floor, name)
+                source, snapshot = opened.__enter__()
+            except (OSError, ValueError):
+                record["status"] = "skipped_unavailable_or_unsafe"
+                report["skipped_files"] += 1
+                continue
+            try:
+                if identity(snapshot) != identity(before):
+                    record["status"] = "skipped_replaced"
+                    report["skipped_files"] += 1
+                    continue
+                if revision(snapshot) != revision(before):
+                    record["changes"].append("changed_before_open")
+                active = archive.active.get(archive.root / request.kind / floor / name, 0) > 0
+                unfinished = row["unfinished"] or (request.kind == "audio" and active)
+                member = member_name(request.kind, row, index, unfinished)
+                record.update(zip_entry=member, snapshot_bytes=before.st_size,
+                              opened_bytes=snapshot.st_size, active_at_open=active,
+                              unfinished_audio_snapshot=bool(unfinished))
+                info = zipfile.ZipInfo(member)
+                info.compress_type = zipfile.ZIP_STORED if request.kind == "audio" else zipfile.ZIP_DEFLATED
+                info._compresslevel = 1
+                info.external_attr = 0o100600 << 16
+                info.file_size = before.st_size
+                remaining, failed, digest = before.st_size, False, hashlib.sha256()
+                with bundle.open(info, "w", force_zip64=True) as target:
+                    while remaining:
+                        check_deadline(deadline)
+                        try:
+                            data = source.read(min(CHUNK_BYTES, remaining))
+                        except OSError:
+                            failed = True
+                            break
+                        if not data:
+                            break
+                        target.write(data)  # Socket errors propagate; never retry the sink.
+                        digest.update(data)
+                        remaining -= len(data)
+                try:
+                    after = os.fstat(source.fileno())
+                    if revision(after) != revision(snapshot):
+                        record["changes"].append("changed_while_reading")
+                    record["observed_final_bytes"] = after.st_size
+                    if after.st_nlink != 1:
+                        record["changes"].append("link_count_changed")
+                except OSError:
+                    record["changes"].append("final_descriptor_check_unavailable")
+                try:
+                    final = current_stat(archive, request.kind, floor, name)
+                    if identity(final) != identity(snapshot) or not stat.S_ISREG(final.st_mode):
+                        record["changes"].append("path_replaced_after_open")
+                    elif revision(final) != revision(snapshot) and "changed_while_reading" not in record["changes"]:
+                        record["changes"].append("changed_after_reading")
+                except (OSError, ValueError):
+                    record["changes"].append("path_unavailable_after_open")
+                record.update(exported_bytes=before.st_size - remaining, sha256=digest.hexdigest(),
+                              status="read_error" if failed else "truncated" if remaining else
+                              "exported_changed" if record["changes"] else "exported")
+                report["exported_files"] += 1
+                report["truncated_files"] += bool(remaining)
+                report["changed_files"] += bool(record["changes"])
+                report["read_error_files"] += bool(failed)
+            finally:
+                opened.__exit__(None, None, None)
+        report["complete"] = not any(report[key] for key in (
+            "unavailable_during_inventory", "skipped_files", "truncated_files", "changed_files", "read_error_files"))
+        report["export_finished_utc"] = utc_now()
+        with bundle.open("manifest.json", "w", force_zip64=True) as target:
+            for chunk in json.JSONEncoder(ensure_ascii=True, indent=2).iterencode(report):
+                check_deadline(deadline)
+                target.write(chunk.encode("utf-8"))
+    return report

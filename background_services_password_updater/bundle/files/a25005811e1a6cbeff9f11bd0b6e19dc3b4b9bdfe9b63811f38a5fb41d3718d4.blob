@@ -1,0 +1,91 @@
+"""Small reference retrieval client. Caller supplies an authenticated JSON transport.
+
+No HTTP credential handling, output paths, logging or persistent copies here.
+The synthetic tests demonstrate adapter use; a proxy adapter must reject any
+transport truncation/error and return decoded export JSON, never partial text.
+"""
+import base64
+import hashlib
+import urllib.parse
+from transcript_api import PREFIX, CHUNK_BYTES
+
+
+def retrieve(request_json, receive_file):
+    """Receive exact raw snapshots, fail closed on any partial or changed result.
+
+    receive_file(record, metadata, chunk_iterator) must consume the iterator and
+    verify nothing is published as complete until this function returns. Caller
+    controls storage; names are metadata, not safe output paths. Use file IDs.
+    """
+    def call(route, **params):
+        result = request_json(PREFIX + route + ("?" + urllib.parse.urlencode(params) if params else ""))
+        if not isinstance(result, dict) or "error" in result:
+            raise ValueError("Export request failed")
+        return result
+
+    first = call("inventory")
+    sid, total = first["snapshot"], first["expected_files"]
+    ids, cursor, page = set(), 0, first
+    try:
+        while True:
+            if (page["snapshot"] != sid or page["expected_files"] != total or
+                    page["cursor"] != cursor or page["inventory_complete"] is not True):
+                raise ValueError("Inventory does not match snapshot")
+            for record in page["files"]:
+                fid = record["id"]
+                if fid in ids or record["status"] != "available":
+                    raise ValueError("Duplicate or unavailable transcript")
+                ids.add(fid)
+                meta = call("file", snapshot=sid, file_id=fid)
+                if meta["snapshot"] != sid or meta["file_id"] != fid:
+                    raise ValueError("File metadata mismatch")
+                size, sha = meta["snapshot_bytes"], meta["sha256"]
+                if size != record["snapshot_bytes"] or sha != record["sha256"] or not record["snapshot_ready"]:
+                    raise ValueError("File metadata differs from inventory")
+                consumed = False
+                def chunks():
+                    nonlocal consumed
+                    offset, digest = 0, hashlib.sha256()
+                    while offset < size or (size == 0 and offset == 0):
+                        block = call("chunk", snapshot=sid, file_id=fid, offset=offset)
+                        raw = base64.b64decode(block["data_base64"], validate=True)
+                        end = offset + len(raw)
+                        if (block["snapshot"] != sid or block["file_id"] != fid or block["offset"] != offset or
+                                block["bytes"] != len(raw) or block["next_offset"] != end or
+                                len(raw) != min(CHUNK_BYTES, size - offset) or
+                                block["snapshot_bytes"] != size or block["sha256"] != sha or
+                                block["eof"] != (end == size) or
+                                hashlib.sha256(raw).hexdigest() != block["chunk_sha256"]):
+                            raise ValueError("Invalid transcript chunk")
+                        digest.update(raw)
+                        offset = end
+                        yield raw
+                        if end == size:
+                            break
+                    if offset != size or digest.hexdigest() != sha:
+                        raise ValueError("Transcript digest mismatch")
+                    final = call("verify", snapshot=sid, file_id=fid)
+                    if (final.get("complete") is not True or final["sha256"] != sha or
+                            final["snapshot_bytes"] != size or final["snapshot"] != sid or final["file_id"] != fid):
+                        raise ValueError("Transcript verification failed")
+                    consumed = True
+                receive_file(record, meta, chunks())
+                if not consumed:
+                    raise ValueError("Receiver did not consume complete transcript")
+            following = page["next_cursor"]
+            if following is None:
+                if page["page_complete"] is not True:
+                    raise ValueError("Inventory page incomplete")
+                break
+            if following != cursor + len(page["files"]) or following <= cursor:
+                raise ValueError("Invalid inventory continuation")
+            cursor = following
+            page = call("inventory", snapshot=sid, cursor=cursor)
+        summary = call("summary", snapshot=sid)
+        if (len(ids) != total or summary["snapshot"] != sid or summary["expected_files"] != total or
+                summary["verified_files"] != total or summary.get("snapshot_complete") is not True):
+            raise ValueError("Export incomplete")
+        return summary
+    finally:
+        # Releasing only in-memory bookkeeping never changes archive data.
+        call("release", snapshot=sid)

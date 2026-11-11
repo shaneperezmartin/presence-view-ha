@@ -1,0 +1,28 @@
+'use strict';
+// Synthetic WebCrypto/DOM harness, not a real iOS/WebView test.
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),{webcrypto}=require('node:crypto');
+function setup(status=201){
+ const elements={},events={},requests=[];
+ for(const id of ['generate','generated','approval','code','password','confirmation','submit','message','enroll'])elements[id]={value:'',disabled:false,textContent:'',addEventListener(e,f){this[e]=f;}};
+ const c={document:{getElementById:id=>elements[id]},isSecureContext:true,crypto:webcrypto,Uint8Array,TextEncoder,Date,Number,Error,fetch:async(u,o)=>{requests.push([u,o]);if(u==='auth/setup-time')return {ok:true,json:async()=>({expires:1800001800})};return {status};}};
+ c.window=c;c.addEventListener=(e,f)=>events[e]=f;
+ vm.createContext(c);vm.runInContext(fs.readFileSync(__dirname+'/setup.html','utf8').match(/<script>([\s\S]*?)<\/script>/)[1],c);
+ return {c,e:elements,events,requests,submit:()=>elements.enroll.submit({preventDefault(){}})};
+}
+function fill(h){h.e.code.value='1'.repeat(64);h.e.password.value=h.e.confirmation.value='synthetic-enrollment-password';}
+test('generate random code with matching hash and server expiry only',async()=>{
+ const h=setup();await h.e.generate.click();assert.match(h.e.generated.value,/^[0-9a-f]{64}$/);
+ const expected=require('node:crypto').createHash('sha256').update(h.e.generated.value).digest('hex');
+ assert.equal(h.e.approval.value,expected+':1800001800');assert.equal(h.requests.length,1);
+});
+test('insecure context cannot generate',async()=>{const h=setup();h.c.isSecureContext=false;await h.e.generate.click();assert.equal(h.e.generated.value,'');assert.equal(h.requests.length,0);});
+test('success submits privately only in body and clears all fields',async()=>{
+ const h=setup();fill(h);await h.submit();const [url,opts]=h.requests[0];assert.equal(url,'auth/enroll');assert.equal(opts.method,'POST');assert.equal(opts.headers['X-Archive-Control'],'1');assert.equal(JSON.parse(opts.body).password,'synthetic-enrollment-password');
+ for(const id of ['generated','approval','code','password','confirmation'])assert.equal(h.e[id].value,'');assert.match(h.e.message.textContent,/Password created/);
+});
+test('mismatch does not submit',async()=>{const h=setup();fill(h);h.e.confirmation.value='different';await h.submit();assert.equal(h.requests.length,0);assert.match(h.e.message.textContent,/do not match/);});
+test('repeated submit suppressed while pending',async()=>{const h=setup();fill(h);let done;h.c.fetch=()=>new Promise(resolve=>{done=resolve;});const pending=h.submit();await h.submit();assert.equal(h.e.submit.disabled,true);done({status:201});await pending;assert.equal(h.e.submit.disabled,false);});
+test('connection loss reports uncertain result and clears fields',async()=>{const h=setup();fill(h);h.c.fetch=async()=>{throw Error('fixture');};await h.submit();assert.match(h.e.message.textContent,/may have succeeded/);assert.equal(h.e.password.value,'');});
+for(const status of [403,409,429,503])test('failed enrollment '+status+' does not imply success',async()=>{const h=setup(status);fill(h);await h.submit();assert.doesNotMatch(h.e.message.textContent,/Password created/);assert.equal(h.e.code.value,'');});
+test('page hide and back-cache restore clear secrets',async()=>{const h=setup();await h.e.generate.click();fill(h);h.events.pagehide();for(const id of ['generated','approval','code','password','confirmation'])assert.equal(h.e[id].value,'');fill(h);h.events.pageshow({persisted:true});assert.equal(h.e.password.value,'');});
+test('navigation during generation cannot repopulate code',async()=>{const h=setup();let done;h.c.fetch=()=>new Promise(resolve=>{done=resolve;});const pending=h.e.generate.click();h.events.pagehide();done({ok:true,json:async()=>({expires:1800001800})});await pending;assert.equal(h.e.generated.value,'');});

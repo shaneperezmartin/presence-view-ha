@@ -1,0 +1,63 @@
+{
+  "name": "Background Services",
+  "version": "0.2.7",
+  "slug": "dji_audio_archive",
+  "description": "Private per-floor audio recording and local transcription with persistent controls",
+  "arch": [
+    "amd64"
+  ],
+  "startup": "application",
+  "boot": "auto",
+  "init": true,
+  "audio": true,
+  "services": [
+    "mqtt:need"
+  ],
+  "ingress": true,
+  "ingress_port": 8099,
+  "watchdog": "http://[HOST]:8099/health",
+  "panel_title": "Background Services",
+  "panel_icon": "mdi:microphone",
+  "homeassistant_api": false,
+  "hassio_api": false,
+  "host_network": false,
+  "backup": "hot",
+  "backup_exclude": [
+    "archive",
+    "archive/*",
+    "models",
+    "models/*",
+    "tmp",
+    "tmp/*"
+  ],
+  "options": {
+    "audio_source": "SELECT_YOUR_PULSE_AUDIO_SOURCE",
+    "whisper_host": "core-whisper",
+    "whisper_port": 10300,
+    "language": "en",
+    "audio_limit_gb": 20,
+    "transcript_limit_mb": 500,
+    "minimum_free_gb": 10,
+    "transcript_export_enabled": false,
+    "transcript_export_token_sha256": "",
+    "app_password_verifier": "",
+    "app_https_hostname": "",
+    "app_ingress_core_peer": "",
+    "app_enrollment_approval": ""
+  },
+  "schema": {
+    "audio_source": "str",
+    "whisper_host": "str",
+    "whisper_port": "port",
+    "language": "str",
+    "audio_limit_gb": "int(2,100)",
+    "transcript_limit_mb": "int(10,2000)",
+    "minimum_free_gb": "int(5,100)",
+    "transcript_export_enabled": "bool",
+    "transcript_export_token_sha256": "str",
+    "app_password_verifier": "str",
+    "app_https_hostname": "str",
+    "app_ingress_core_peer": "str",
+    "app_enrollment_approval": "str"
+  }
+}

@@ -1,0 +1,131 @@
+"""Synthetic fixtures only: never contacts HA or uses user secrets."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch
+from app_auth import AppAuth, password_record
+from enrollment import Enrollment
+CODE='1'*64
+PASSWORD='synthetic-enrollment-password'
+NOW=1800000000
+APPROVAL=hashlib.sha256(CODE.encode()).hexdigest()+':'+str(NOW+1200)
+class EnrollmentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.path=Path(self.tmp.name)/'app-password.json';self.now=NOW
+        self.auth=AppAuth('');self.e=Enrollment(self.auth,self.path,APPROVAL,clock=lambda:self.now)
+    def enroll(self,code=CODE,password=PASSWORD,confirmation=PASSWORD):return self.e.enroll(code,password,confirmation)
+    def test_success_durable_only_verifier_no_auto_session(self):
+        self.assertEqual(self.enroll(),201);data=self.path.read_text()
+        self.assertNotIn(PASSWORD,data);self.assertNotIn(CODE,data)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode),0o600);self.assertEqual(self.auth.sessions,{})
+        fresh=AppAuth('');Enrollment(fresh,self.path,'',clock=lambda:self.now)
+        self.assertEqual(fresh.login(PASSWORD,'fixture')[0],200);self.assertEqual(self.enroll(),409)
+    def test_first_visitor_no_admin_approval(self):
+        self.e.approval='';self.assertEqual(self.enroll(),403);self.assertFalse(self.path.exists())
+    def test_hash_not_code_and_wrong_code_rejected_before_kdf(self):
+        with patch('enrollment.password_record') as kdf:
+            for code in [APPROVAL.split(':')[0],'2'*64,CODE+'!',None,{},'x'*1000]:self.assertIn(self.enroll(code),[403,429])
+            kdf.assert_not_called()
+        self.assertFalse(self.path.exists())
+    def test_expired_malformed_or_long_future_approval(self):
+        for approval in [None,{},'x',APPROVAL+' ',APPROVAL.split(':')[0]+':'+str(NOW),APPROVAL.split(':')[0]+':'+str(NOW+1801)]:
+            self.e.approval=approval;self.assertEqual(self.enroll(),403)
+        self.assertFalse(self.path.exists())
+    def test_expiry_rechecked_after_kdf(self):
+        def slow(p):
+            result=password_record(p);self.now=NOW+1201;return result
+        with patch('enrollment.password_record',side_effect=slow):self.assertEqual(self.enroll(),403)
+        self.assertFalse(self.path.exists())
+    def test_restart_does_not_extend_approval(self):
+        fresh=Enrollment(AppAuth(''),self.path,APPROVAL,clock=lambda:NOW+1201)
+        self.assertEqual(fresh.enroll(CODE,PASSWORD,PASSWORD),403)
+    def test_password_constraints_and_confirmation(self):
+        for password,confirmation in [('short','short'),('x'*257,'x'*257),(PASSWORD,'different'),(None,None)]:self.assertEqual(self.enroll(password=password,confirmation=confirmation),400)
+        self.assertFalse(self.path.exists())
+    def test_rate_limit(self):
+        for _ in range(5):self.assertEqual(self.enroll(code='2'*64),403)
+        self.assertEqual(self.enroll(),429);self.now+=301;self.assertEqual(self.enroll(),201)
+    def test_existing_and_corrupt_legacy_options_block(self):
+        for verifier in ['corrupt',json.dumps(password_record(PASSWORD))]:
+            e=Enrollment(AppAuth(verifier),self.path,APPROVAL,configured_verifier=verifier,clock=lambda:NOW)
+            self.assertEqual(e.enroll(CODE,PASSWORD,PASSWORD),409)
+    def test_bad_file_never_falls_back_to_option(self):
+        for contents in ['', 'not json','[]','x'*2048]:
+            self.path.write_text(contents);auth=AppAuth(json.dumps(password_record(PASSWORD)))
+            e=Enrollment(auth,self.path,APPROVAL,clock=lambda:NOW)
+            self.assertIsNone(auth.record);self.assertEqual(e.enroll(CODE,PASSWORD,PASSWORD),409)
+    def test_symlink_directory_fifo_block_without_reading(self):
+        self.path.symlink_to(Path(self.tmp.name)/'missing')
+        for kind in ['link','directory','fifo']:
+            if kind=='directory':self.path.unlink();self.path.mkdir()
+            if kind=='fifo':self.path.rmdir();os.mkfifo(self.path)
+            e=Enrollment(AppAuth(''),self.path,APPROVAL,clock=lambda:NOW)
+            self.assertTrue(e.blocked);self.assertIsNone(e.auth.record);self.assertEqual(e.enroll(CODE,PASSWORD,PASSWORD),409)
+    def test_file_precedence_over_old_option(self):
+        self.assertEqual(self.enroll(),201);auth=AppAuth(json.dumps(password_record('another-synthetic-password')))
+        Enrollment(auth,self.path,APPROVAL,clock=lambda:NOW)
+        self.assertEqual(auth.login(PASSWORD,'fixture')[0],200);self.assertEqual(auth.login('another-synthetic-password','fixture')[0],401)
+    def test_parallel_enrollment_one_winner(self):
+        results=[];threads=[threading.Thread(target=lambda:results.append(self.enroll())) for _ in range(4)]
+        for t in threads:t.start()
+        for t in threads:t.join()
+        self.assertEqual(sorted(results),[201,409,409,409])
+    def test_failed_sync_locks_state(self):
+        with patch('enrollment.os.fsync',side_effect=OSError('fixture')):self.assertEqual(self.enroll(),503)
+        self.assertIsNone(self.auth.record);self.assertEqual(self.enroll(),409)
+class EnrollmentHTTPTests(unittest.TestCase):
+    def setUp(self):
+        from test_app_auth import HTTPTests, ROUTE
+        from server import Handler, BoundedHTTPServer
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.auth=AppAuth('', **ROUTE)
+        self.server=BoundedHTTPServer(('127.0.0.1',0),Handler)
+        self.server.app_auth=self.auth
+        self.server.enrollment=Enrollment(self.auth,Path(self.tmp.name)/'password.json',APPROVAL,clock=lambda:NOW)
+        self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
+        self.addCleanup(lambda:HTTPTests.cleanup(self))
+        self.request=lambda *args,**kwargs:HTTPTests.request(self,*args,**kwargs)
+        self.body=json.dumps({'code':CODE,'password':PASSWORD,'confirmation':PASSWORD})
+        self.headers={'Content-Type':'application/json','X-Archive-Control':'1'}
+    def test_transport_required_even_with_approval(self):
+        for path in ['/setup','/auth/setup-time']:
+            self.assertEqual(self.request(path)[0],403)
+        self.assertEqual(self.request('/auth/enroll','POST',self.body,self.headers)[0],403)
+    def test_http_flow_no_auto_login_and_no_sensitive_response(self):
+        from test_app_auth import PREFIX
+        with patch.object(self.auth,'context',return_value=PREFIX):
+            status,headers,data=self.request('/auth/enroll','POST',self.body,self.headers)
+            self.assertEqual(status,201);self.assertNotIn('Set-Cookie',headers)
+            self.assertEqual(json.loads(data),{'ok':True})
+            self.assertEqual(self.request('/api/status')[0],401)
+            self.assertEqual(self.request('/auth/enroll','POST',self.body,self.headers)[0],409)
+            self.assertEqual(self.request('/auth/login','POST',json.dumps({'password':PASSWORD}),self.headers)[0],200)
+    def test_csrf_shape_and_body_limit(self):
+        from test_app_auth import PREFIX
+        with patch.object(self.auth,'context',return_value=PREFIX):
+            self.assertEqual(self.request('/auth/enroll','POST',self.body)[0],403)
+            for body in ['{}','[]',json.dumps({'code':CODE,'password':PASSWORD}), 'x'*8193]:
+                self.assertEqual(self.request('/auth/enroll','POST',body,self.headers)[0],400)
+            self.assertEqual(self.request('/auth/enroll','POST',self.body,{**self.headers,'Content-Type':'text/plain'})[0],403)
+            self.assertEqual(self.request('/auth/enroll','POST',self.body,{**self.headers,'Transfer-Encoding':'chunked'})[0],403)
+    def test_maximum_unicode_password_including_escaped_json(self):
+        from test_app_auth import PREFIX
+        password='😀'*256
+        body=json.dumps({'code':CODE,'password':password,'confirmation':password})
+        with patch.object(self.auth,'context',return_value=PREFIX):
+            self.assertEqual(self.request('/auth/enroll','POST',body,self.headers)[0],201)
+            self.assertEqual(self.request('/auth/login','POST',json.dumps({'password':password}),self.headers)[0],200)
+    def test_setup_time_no_cache(self):
+        from test_app_auth import PREFIX
+        with patch.object(self.auth,'context',return_value=PREFIX), patch('server.time.time',return_value=NOW):
+            status,headers,data=self.request('/auth/setup-time')
+            self.assertEqual(status,200);self.assertEqual(json.loads(data),{'expires':NOW+1800})
+            self.assertEqual(headers['Cache-Control'],'no-store')
+
+if __name__=='__main__':unittest.main()

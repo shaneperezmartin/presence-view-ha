@@ -1,0 +1,351 @@
+"""Synthetic only: no microphone, speech model, HA calls or private captures."""
+from contextlib import contextmanager
+import hashlib
+from http.server import ThreadingHTTPServer
+import io
+import json
+import os
+from pathlib import Path
+import socket
+import tempfile
+import threading
+import tracemalloc
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+import urllib.error
+import urllib.request
+import zipfile
+
+from archive import Archive
+from server import Handler
+import transcript_export as export
+
+
+class ExportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.archive = Archive(Path(self.temp.name) / "archive")
+
+    def put(self, floor="upstairs", name="20261107T120000.000000Z_aabbccdd.txt", data=b"Speaker 2: Synthetic words.\r\n"):
+        path = self.archive.safe("transcripts", floor, name)
+        path.write_bytes(data)
+        return path
+
+    def result(self, paths=None):
+        output = io.BytesIO()
+        report = export.write_export(self.archive, export.inventory(self.archive) if paths is None else paths, output)
+        bundle = zipfile.ZipFile(io.BytesIO(output.getvalue()))
+        self.addCleanup(bundle.close)
+        self.assertIsNone(bundle.testzip())
+        self.assertEqual(json.loads(bundle.read("manifest.json")), report)
+        return bundle, report
+
+    def test_all_243_files_both_floors_not_newest_100(self):
+        originals = {}
+        for floor in ("upstairs", "downstairs"):
+            for index in range(121):
+                path = self.put(floor, f"fixture-{index:04d}.txt", f"Speaker 1: {floor} synthetic {index}\n".encode())
+                originals[(floor, path.name)] = path.read_bytes()
+        self.put(name="zero.txt", data=b"")
+        originals[("upstairs", "zero.txt")] = b""
+        audio = self.archive.safe("audio", "upstairs", "do-not-export.aac")
+        audio.write_bytes(b"synthetic audio")
+        bundle, report = self.result()
+        self.assertEqual(report["expected_files"], 243)
+        self.assertEqual(report["exported_files"], 243)
+        self.assertTrue(report["complete"])
+        for record in report["files"]:
+            data = originals[(record["floor"], record["source_name"])]
+            self.assertEqual(bundle.read(record["zip_entry"]), data)
+            self.assertEqual(record["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertNotIn("do-not-export", " ".join(bundle.namelist()))
+        self.assertEqual(audio.read_bytes(), b"synthetic audio")
+
+    def test_empty_archive_has_successful_zero_file_manifest(self):
+        bundle, report = self.result()
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["exported_files"], 0)
+        self.assertEqual(set(bundle.namelist()), {"README.txt", "manifest.json", "upstairs/", "downstairs/"})
+
+    def test_source_bytes_names_controls_and_retention_are_untouched(self):
+        raw = b"Speaker 1: Teddy, not Terry!\r\npartial \xff\x00"
+        path = self.put(data=raw)
+        self.archive.active[path] = 2
+        before = path.stat()
+        counters = dict(self.archive.active)
+        paths = list(Path(self.temp.name).rglob("*"))
+        bundle, report = self.result()
+        self.assertEqual(bundle.read(report["files"][0]["zip_entry"]), raw)
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual(dict(self.archive.active), counters)
+        self.assertEqual(list(Path(self.temp.name).rglob("*")), paths)
+
+    def test_append_after_snapshot_does_not_leak_into_export(self):
+        path = self.put(data=b"before\n")
+        original_open = export.open_transcript
+        @contextmanager
+        def appended(*args):
+            with original_open(*args) as pair:
+                with path.open("ab") as writer:
+                    writer.write(b"later append\n")
+                yield pair
+        with patch.object(export, "open_transcript", appended):
+            bundle, report = self.result()
+        self.assertEqual(bundle.read(report["files"][0]["zip_entry"]), b"before\n")
+        self.assertEqual(path.read_bytes(), b"before\nlater append\n")
+
+    def test_new_files_after_inventory_wait_for_next_export(self):
+        self.put(name="first.txt")
+        paths = export.inventory(self.archive)
+        self.put(name="new.txt")
+        _, report = self.result(paths)
+        self.assertEqual(report["expected_files"], 1)
+        self.assertEqual(report["files"][0]["source_name"], "first.txt")
+
+    def test_retention_removal_is_reported_not_silent(self):
+        path = self.put()
+        paths = export.inventory(self.archive)
+        path.unlink()
+        _, report = self.result(paths)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["skipped_files"], 1)
+        self.assertEqual(report["files"][0]["status"], "skipped_unavailable")
+
+    def test_shortened_file_is_explicitly_incomplete(self):
+        path = self.put(data=b"longer original\n")
+        original_open = export.open_transcript
+        @contextmanager
+        def shortened(*args):
+            with original_open(*args) as pair:
+                path.write_bytes(b"short")
+                yield pair
+        with patch.object(export, "open_transcript", shortened):
+            bundle, report = self.result()
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["truncated_files"], 1)
+        self.assertEqual(bundle.read(report["files"][0]["zip_entry"]), b"short")
+
+    def test_same_second_names_remain_unique_and_safe(self):
+        self.put(name="20261107T120000.000000Z_aaaaaaaa.txt")
+        self.put(name="20261107T120000.000001Z_bbbbbbbb.txt")
+        self.put(name="CON.txt")
+        bundle, report = self.result()
+        names = [record["zip_entry"] for record in report["files"]]
+        self.assertEqual(len(set(names)), 3)
+        for name in names:
+            self.assertNotIn("..", Path(name).parts)
+            self.assertFalse(name.startswith("/"))
+            for char in '<>:"\\|?*':
+                self.assertNotIn(char, name)
+        self.assertEqual(len(bundle.namelist()), 7)
+
+    def test_unsafe_paths_and_nontext_excluded(self):
+        self.put()
+        folder = self.archive.root / "transcripts" / "upstairs"
+        (folder / "unrelated.json").write_text("not transcript")
+        (folder / "nested.txt").mkdir()
+        self.assertEqual(len(export.inventory(self.archive)), 1)
+        for floor, name in (("upstairs", "../outside.txt"), ("other", "data.txt"), ("upstairs", "bad\\path.txt")):
+            with self.assertRaises((ValueError, OSError)):
+                with export.open_transcript(self.archive, floor, name):
+                    self.fail("Unsafe open succeeded")
+
+    def test_invalid_filename_date_still_exports_saved_text(self):
+        path = self.put(name="20269999T120000.000000Z_aaaaaaaa.txt")
+        bundle, report = self.result()
+        self.assertTrue(report["complete"])
+        self.assertEqual(bundle.read(report["files"][0]["zip_entry"]), path.read_bytes())
+
+    def test_symlinks_rejected(self):
+        outside = Path(self.temp.name) / "outside.txt"
+        outside.write_bytes(b"must not export")
+        link = self.archive.root / "transcripts" / "upstairs" / "link.txt"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("Symlink creation unavailable on this host")
+        self.assertEqual(export.inventory(self.archive), [])
+        _, report = self.result([("upstairs", "link.txt")])
+        self.assertEqual(report["skipped_files"], 1)
+
+    @unittest.skipIf(os.name == "nt", "Linux directory-fd protection")
+    def test_inventory_directory_swap_cannot_disclose_outside_names(self):
+        self.put(name="inside.txt")
+        folder = self.archive.root / "transcripts" / "upstairs"
+        saved = folder.with_name("upstairs-saved")
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        (outside / "outside-private-name.txt").write_text("not exportable")
+        real_scan = os.scandir
+        swapped = False
+        def raced_scan(directory):
+            nonlocal swapped
+            if swapped:
+                return real_scan(directory)
+            swapped = True
+            folder.rename(saved)
+            try:
+                folder.symlink_to(outside, target_is_directory=True)
+                return real_scan(directory)
+            finally:
+                if folder.is_symlink():
+                    folder.unlink()
+                saved.rename(folder)
+        with patch.object(export.os, "scandir", raced_scan):
+            paths = export.inventory(self.archive)
+        self.assertEqual(paths, [("upstairs", "inside.txt")])
+
+    @unittest.skipIf(os.name == "nt", "POSIX open-file replacement semantics")
+    def test_label_replacement_after_open_keeps_original_snapshot(self):
+        path = self.put(data=b"original words\n")
+        original_open = export.open_transcript
+        @contextmanager
+        def replaced(*args):
+            with original_open(*args) as pair:
+                replacement = path.with_suffix(".new")
+                replacement.write_bytes(b"Speaker 1: original words\n")
+                os.replace(replacement, path)
+                yield pair
+        with patch.object(export, "open_transcript", replaced):
+            bundle, report = self.result()
+        self.assertEqual(bundle.read(report["files"][0]["zip_entry"]), b"original words\n")
+        self.assertEqual(path.read_bytes(), b"Speaker 1: original words\n")
+
+    def test_file_count_limit_fails_before_silent_truncation(self):
+        for i in range(3):
+            self.put(name=f"{i}.txt")
+        with patch.object(export, "MAX_FILES", 2):
+            with self.assertRaises(OverflowError):
+                export.inventory(self.archive)
+
+    def test_large_no_newline_transcript_uses_bounded_memory(self):
+        path = self.put(data=b"x" * (8 * 1024 * 1024))
+        class Sink:
+            def write(self, data): return len(data)
+            def flush(self): pass
+        tracemalloc.start()
+        try:
+            export.write_export(self.archive, export.inventory(self.archive), Sink())
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 2 * 1024 * 1024)
+        self.assertEqual(path.stat().st_size, 8 * 1024 * 1024)
+
+    def test_deadline_prevents_unbounded_stream_lifetime(self):
+        self.put()
+        with patch.object(export, "MAX_SECONDS", -1):
+            with self.assertRaises(OSError):
+                export.write_export(self.archive, export.inventory(self.archive), io.BytesIO())
+
+    def test_failed_socket_is_not_retried_during_zip_cleanup(self):
+        self.put()
+        class FailedSocket:
+            writes = 0
+            def write(self, data):
+                self.writes += 1
+                raise TimeoutError("synthetic idle timeout")
+            def flush(self): pass
+        sink = FailedSocket()
+        with self.assertRaises(OSError):
+            export.write_export(self.archive, export.inventory(self.archive), sink)
+        self.assertEqual(sink.writes, 1)
+
+    def test_short_socket_write_is_not_retried_during_zip_cleanup(self):
+        self.put()
+        class ShortSocket:
+            writes = 0
+            def write(self, data):
+                self.writes += 1
+                return 0
+            def flush(self): pass
+        sink = ShortSocket()
+        with self.assertRaises(OSError):
+            export.write_export(self.archive, export.inventory(self.archive), sink)
+        self.assertEqual(sink.writes, 1)
+
+    @contextmanager
+    def http(self, handler=Handler):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        # Component regression harness: authenticated boundary tested separately in test_app_auth.
+        server.app_auth = SimpleNamespace(context=lambda h: "/api/hassio_ingress/" + "x"*32, authenticated=lambda h, **kw: True)
+        server.daemon_threads = True
+        server.controller = SimpleNamespace(archive=self.archive)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            yield f"http://127.0.0.1:{server.server_port}", opener, server
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_http_download_zip_headers_and_readonly_repeated_requests(self):
+        path = self.put()
+        with self.http() as (base, opener, _):
+            for _ in range(2):
+                with opener.open(base + "/download-transcripts.zip") as response:
+                    self.assertEqual(response.headers["Content-Type"], "application/zip")
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+                    self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+                    self.assertIn("attachment;", response.headers["Content-Disposition"])
+                    self.assertIsNone(response.headers.get("Content-Length"))
+                    with zipfile.ZipFile(io.BytesIO(response.read())) as bundle:
+                        report = json.loads(bundle.read("manifest.json"))
+                        self.assertTrue(report["complete"])
+                        self.assertEqual(bundle.read(report["files"][0]["zip_entry"]), path.read_bytes())
+
+    def test_ingress_check_still_blocks_untrusted_clients(self):
+        class Denied(Handler):
+            def permitted(self): return False
+        with self.http(Denied) as (base, opener, _):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                opener.open(base + "/download-transcripts.zip")
+            self.assertEqual(caught.exception.code, 403)
+            caught.exception.close()
+
+    def test_repeated_click_while_busy_rejected_then_recovers(self):
+        with self.http() as (base, opener, _):
+            with Handler.export_lock:
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    opener.open(base + "/download-transcripts.zip")
+                self.assertEqual(caught.exception.code, 409)
+                caught.exception.close()
+            with opener.open(base + "/download-transcripts.zip") as response:
+                self.assertEqual(response.status, 200)
+
+    def test_unexpected_query_rejected(self):
+        with self.http() as (base, opener, _):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                opener.open(base + "/download-transcripts.zip?path=/data/options.json")
+            self.assertEqual(caught.exception.code, 404)
+            caught.exception.close()
+
+    def test_failure_before_headers_releases_lock(self):
+        with self.http() as (base, opener, _):
+            with patch("server.inventory", side_effect=OSError("synthetic")):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    opener.open(base + "/download-transcripts.zip")
+                self.assertEqual(caught.exception.code, 503)
+                caught.exception.close()
+            with opener.open(base + "/download-transcripts.zip") as response:
+                self.assertEqual(response.status, 200)
+
+    def test_midstream_failure_never_appends_http_error_and_releases_lock(self):
+        def failed(archive, paths, output):
+            output.write(b"partial-zip")
+            raise BrokenPipeError()
+        with self.http() as (base, opener, _):
+            with patch("server.write_export", failed):
+                with opener.open(base + "/download-transcripts.zip") as response:
+                    self.assertEqual(response.read(), b"partial-zip")
+            with opener.open(base + "/download-transcripts.zip") as response:
+                self.assertEqual(response.status, 200)
+
+
+if __name__ == "__main__":
+    unittest.main()

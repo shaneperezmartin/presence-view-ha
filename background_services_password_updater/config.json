@@ -1,0 +1,42 @@
+{
+  "name": "Background Services Password Source Updater",
+  "version": "0.1.0",
+  "slug": "background_services_password_updater",
+  "description": "Manual offline source-only helper for the reviewed 0.2.6 to 0.2.7 password candidate",
+  "arch": [
+    "amd64"
+  ],
+  "startup": "once",
+  "boot": "manual",
+  "init": false,
+  "homeassistant_api": false,
+  "hassio_api": false,
+  "host_network": false,
+  "audio": false,
+  "map": [
+    {
+      "type": "local_apps",
+      "read_only": false
+    }
+  ],
+  "options": {
+    "mode": "inspect",
+    "expected_fingerprint": "",
+    "maintenance_confirmed": false,
+    "rollback_security_loss_confirmed": false,
+    "preserve_extra_files": [],
+    "diagnostic_offset": 0,
+    "diagnostic_snapshot": ""
+  },
+  "schema": {
+    "mode": "list(inspect|diagnose|apply|rollback)",
+    "expected_fingerprint": "str",
+    "maintenance_confirmed": "bool",
+    "rollback_security_loss_confirmed": "bool",
+    "preserve_extra_files": [
+      "str"
+    ],
+    "diagnostic_offset": "int(0,255)",
+    "diagnostic_snapshot": "str"
+  }
+}

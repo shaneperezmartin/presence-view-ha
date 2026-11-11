@@ -1,0 +1,73 @@
+"""Readable exports; archive identifiers, source text and retention remain intact."""
+from datetime import datetime, timedelta, timezone
+import re
+from zoneinfo import ZoneInfo
+
+LOCAL = ZoneInfo("America/New_York")
+ISO = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+PASSAGE = re.compile(rf"^\[({ISO}) - ({ISO})\](.*)$")
+HEADER = re.compile(rf"^DJI (Upstairs|Downstairs) \| capture start ({ISO})$")
+CLOSED = re.compile(rf"^Capture closed: ({ISO})(.*)$")
+TURN = re.compile(r"^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?): (Speaker \d+)$")
+NAME = re.compile(r"^(\d{8}T\d{6}\.\d{6}Z)_[0-9a-f]+(\.txt|\.labeling\.txt|\.aac|\.aac\.part)$")
+
+
+def date(value):
+    return f"{value.month}-{value.day}-{value.year}"
+
+
+def clock(value, filename=False):
+    sep = "-" if filename else ":"
+    return f"{value.hour % 12 or 12}{sep}{value.minute:02}{sep}{value.second:02} {'AM' if value.hour < 12 else 'PM'}"
+
+
+def instant(value):
+    local = value.astimezone(LOCAL)
+    return f"{date(local)} {clock(local)} {local.tzname()}"
+
+
+def interval(start, end):
+    a, b = start.astimezone(LOCAL), end.astimezone(LOCAL)
+    if a.date() == b.date() and a.utcoffset() == b.utcoffset():
+        return f"{date(a)} · {clock(a)}–{clock(b)} {b.tzname()}"
+    return f"{instant(a)} – {instant(b)}"
+
+
+def friendly_name(name, floor, kind):
+    match = NAME.fullmatch(name)
+    if not match:
+        return re.sub(r'[^a-zA-Z0-9._ -]', '_', f"{floor}_{name}")
+    value = datetime.strptime(match[1], "%Y%m%dT%H%M%S.%fZ").replace(tzinfo=timezone.utc).astimezone(LOCAL)
+    title = "Audio" if kind == "audio" else "Transcript"
+    suffix = ".aac" if kind == "audio" else ".txt"
+    progress = " - In progress" if match[2] in (".labeling.txt", ".aac.part") else ""
+    return f"{floor.title()} {title} - {date(value)} - {clock(value, True)} {value.tzname()}{progress}{suffix}"
+
+
+def formatted_chunks(source, size):
+    """Format only metadata, streaming a fixed-size snapshot without copying to disk."""
+    remaining, started, timeline = size, None, False
+    while remaining:
+        raw = source.readline(remaining)
+        if not raw:
+            break
+        remaining -= len(raw)
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        newline = "\n" if raw.endswith(b"\n") else ""
+        try:
+            header, passage, closed = HEADER.fullmatch(line), PASSAGE.fullmatch(line), CLOSED.fullmatch(line)
+            if header:
+                started = datetime.fromisoformat(header[2])
+                line = f"{header[1]} transcript\nStarted: {instant(started)}\nTime zone: America/New_York (daylight saving time applied)"
+            elif passage:
+                line = f"[{interval(datetime.fromisoformat(passage[1]), datetime.fromisoformat(passage[2]))}]{passage[3]}"
+            elif closed:
+                line = f"Capture ended: {instant(datetime.fromisoformat(closed[1]))}{closed[2]}"
+            elif line == "Speaker timeline (seconds from capture start):" and started:
+                timeline = True
+                line = "Speaker timeline (New York time):"
+            elif timeline and (turn := TURN.fullmatch(line)):
+                line = f"[{interval(started + timedelta(seconds=float(turn[1])), started + timedelta(seconds=float(turn[2])))}] {turn[3]}"
+        except (ValueError, OverflowError):
+            pass  # Preserve malformed metadata instead of losing a downloadable transcript.
+        yield (line + newline).encode("utf-8")

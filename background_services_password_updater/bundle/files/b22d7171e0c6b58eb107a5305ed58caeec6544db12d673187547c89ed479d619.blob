@@ -1,0 +1,180 @@
+"""Synthetic isolated password fixtures. No live credentials or Home Assistant."""
+from email.message import Message
+import http.client
+import io
+import json
+import threading
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+from app_auth import AppAuth, password_record, COOKIE, IDLE, ABSOLUTE
+from server import Handler, BoundedHTTPServer, SessionWriter
+from transcript_api import PREFIX as API
+
+PASSWORD='synthetic-password-not-real'
+HOSTNAME='fixture.tailtest.ts.net'
+CORE='172.30.32.1'
+ROUTE={'https_hostname':HOSTNAME,'ingress_core_peer':CORE}
+PREFIX='/api/hassio_ingress/'+'a'*32
+
+class AuthTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls): cls.verifier=json.dumps(password_record(PASSWORD))
+    def setUp(self):
+        self.now=100.
+        self.auth=AppAuth(self.verifier, clock=lambda:self.now, **ROUTE)
+    def handler(self, token='', prefix=PREFIX, proto='https', peer='172.30.32.2'):
+        headers=Message();headers['X-Ingress-Path']=prefix;headers['X-Forwarded-Proto']=proto
+        headers['X-Forwarded-Host']=HOSTNAME
+        headers['X-Forwarded-For']='100.64.0.10, 127.0.0.1, '+CORE
+        if token: headers['Cookie']=COOKIE+'='+token
+        return SimpleNamespace(headers=headers,client_address=(peer,1))
+    def test_valid_login_cookie_and_logout(self):
+        status,token=self.auth.login(PASSWORD,PREFIX);self.assertEqual(status,200)
+        h=self.handler(token);self.assertTrue(self.auth.authenticated(h))
+        cookie=self.auth.cookie(token,PREFIX)
+        for value in ['Secure','HttpOnly','SameSite=Strict','Path='+PREFIX+'/']:self.assertIn(value,cookie)
+        self.auth.logout(h);self.assertFalse(self.auth.authenticated(h))
+    def test_empty_corrupt_fail_closed(self):
+        for value in ['', '{}','null','[]','x'*1025, None, json.dumps({'version':1,'salt':'x','digest':'x'})]:
+            self.assertEqual(AppAuth(value).login(PASSWORD,PREFIX),(503,None))
+    def test_wrong_password_rate_limited(self):
+        for _ in range(5): self.assertEqual(self.auth.login('wrong-password-fixture',PREFIX)[0],401)
+        self.assertEqual(self.auth.login(PASSWORD,PREFIX)[0],429)
+        self.now+=301;self.assertEqual(self.auth.login(PASSWORD,PREFIX)[0],200)
+    def test_trusted_context_only(self):
+        for kwargs in [{'peer':'127.0.0.1'},{'peer':'1.2.3.4'},{'proto':'http'},{'proto':'https,http'},{'prefix':'/bad'},{'prefix':PREFIX+'/'},{'prefix':PREFIX+';Path=/'}]:
+            self.assertIsNone(self.auth.context(self.handler(**kwargs)))
+        h=self.handler();h.headers['X-Forwarded-Proto']='https';self.assertIsNone(self.auth.context(h))
+    def test_expiry_and_prefix_bound(self):
+        _,token=self.auth.login(PASSWORD,PREFIX)
+        self.assertFalse(self.auth.authenticated(self.handler(token,prefix='/api/hassio_ingress/'+'b'*32)))
+        _,token=self.auth.login(PASSWORD,PREFIX);self.now+=IDLE
+        self.assertFalse(self.auth.authenticated(self.handler(token)))
+        self.now+=301;_,token=self.auth.login(PASSWORD,PREFIX)
+        for _ in range(ABSOLUTE//500):self.now+=500;self.auth.authenticated(self.handler(token))
+        self.now+=501;self.assertFalse(self.auth.authenticated(self.handler(token)))
+    def test_restart_invalidates_and_duplicates_rejected(self):
+        _,token=self.auth.login(PASSWORD,PREFIX)
+        self.assertFalse(AppAuth(self.verifier, **ROUTE).authenticated(self.handler(token)))
+        h=self.handler(token);h.headers.replace_header('Cookie',f'{COOKIE}={token}; {COOKIE}={token}')
+        self.assertFalse(self.auth.authenticated(h))
+    def test_stream_stops_after_logout(self):
+        _,token=self.auth.login(PASSWORD,PREFIX);h=self.handler(token)
+        output=io.BytesIO();writer=SessionWriter(output,self.auth,h);writer.write(b'fixture')
+        self.auth.logout(h)
+        with self.assertRaises(ConnectionResetError):writer.write(b'secret')
+        self.assertEqual(output.getvalue(),b'fixture')
+
+class HTTPTests(AuthTests):
+    def setUp(self):
+        super().setUp()
+        self.server=BoundedHTTPServer(('127.0.0.1',0),Handler)
+        self.server.app_auth=self.auth
+        self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
+        self.addCleanup(self.cleanup)
+    def cleanup(self):self.server.shutdown();self.server.server_close();self.thread.join()
+    def request(self,path,method='GET',body=None,headers=None):
+        c=http.client.HTTPConnection('127.0.0.1',self.server.server_port,timeout=3)
+        try:
+            c.request(method,path,body=body,headers=headers or {})
+            r=c.getresponse();return r.status,dict(r.getheaders()),r.read()
+        finally:c.close()
+    def test_actual_local_peer_cannot_spoof_proxy(self):
+        headers={'X-Ingress-Path':PREFIX,'X-Forwarded-Proto':'https','X-Forwarded-For':'172.30.32.2'}
+        self.assertEqual(self.request('/api/status',headers=headers)[0],403)
+    def test_health_is_minimal(self):
+        status,_,body=self.request('/health');self.assertEqual(status,200);self.assertEqual(json.loads(body),{'ok':True})
+    def test_all_content_routes_locked_and_bearer_disabled(self):
+        with patch.object(self.auth,'context',return_value=PREFIX):
+            for path in ['/api/status','/api/files','/api/diagnostics','/api/model-setup','/api/diarization','/api/batch-preview','/download/a/b/c','/download-batch.zip','/download-transcripts.zip']:
+                self.assertEqual(self.request(path)[0],401,path)
+            for path in ['/','/index.html','/model-setup']:self.assertEqual(self.request(path)[0],303,path)
+            for path in ['/api/control','/api/model-setup','/api/self-test','/api/diarization-test']:
+                self.assertEqual(self.request(path,'POST','{}')[0],401,path)
+            for method in ['GET','POST']:
+                self.assertEqual(self.request(API+'inventory',method,headers={'Authorization':'Bearer synthetic'})[0],403)
+    def test_login_csrf_logout_and_session_cookie(self):
+        headers={'Content-Type':'application/json','X-Archive-Control':'1'}
+        with patch.object(self.auth,'context',return_value=PREFIX):
+            self.assertEqual(self.request('/auth/login','POST',json.dumps({'password':PASSWORD}))[0],403)
+            code,h,_=self.request('/auth/login','POST',json.dumps({'password':PASSWORD}),headers)
+            self.assertEqual(code,200);headers['Cookie']=h['Set-Cookie'].split(';')[0]
+            self.assertEqual(self.request('/unknown',headers=headers)[0],404)
+            # Even authenticated browser cannot reactivate bearer route.
+            self.assertEqual(self.request(API+'inventory',headers=headers)[0],403)
+            self.assertEqual(self.request('/auth/logout','POST','{}',headers)[0],200)
+            self.assertEqual(self.request('/api/status',headers=headers)[0],401)
+    def test_missing_auth_object_fails_closed(self):
+        del self.server.app_auth
+        self.assertEqual(self.request('/api/status')[0],503)
+
+
+class TransportTests(unittest.TestCase):
+    def setUp(self):
+        self.auth=AppAuth('', **ROUTE)
+    def handler(self, xff='100.64.0.10, 127.0.0.1, '+CORE, proto='https', host=HOSTNAME, peer='172.30.32.2'):
+        h=Message();h['X-Ingress-Path']=PREFIX;h['X-Forwarded-Proto']=proto
+        h['X-Forwarded-Host']=host;h['X-Forwarded-For']=xff
+        return SimpleNamespace(headers=h,client_address=(peer,1))
+    def test_pinned_tailnet_route_v4_and_v6(self):
+        self.assertEqual(self.auth.context(self.handler()),PREFIX)
+        self.assertEqual(self.auth.context(self.handler('fd7a:115c:a1e0::1234, 127.0.0.1, '+CORE)),PREFIX)
+    def test_missing_or_malformed_route_is_locked(self):
+        for settings in [{},{'https_hostname':HOSTNAME},{'ingress_core_peer':CORE},
+                         {**ROUTE,'https_hostname':'https://'+HOSTNAME},
+                         {**ROUTE,'https_hostname':'attacker.example'},
+                         {**ROUTE,'https_hostname':HOSTNAME+':443'},
+                         {**ROUTE,'ingress_core_peer':'0.0.0.0'},
+                         {**ROUTE,'ingress_core_peer':'127.0.0.1'}]:
+            self.assertIsNone(AppAuth('',**settings).context(self.handler()))
+    def test_direct_http_spoof_gains_real_peer_and_is_denied(self):
+        # Model the reviewed Core and Supervisor append behavior. No live calls.
+        for client in ['192.168.1.23','100.64.0.10']:
+            for forged in ['', '100.64.0.10', '100.64.0.10, 127.0.0.1',
+                           '100.64.0.10, 127.0.0.1, '+CORE]:
+                core=(forged+', ' if forged else '')+client
+                final=core+', '+CORE
+                self.assertIsNone(self.auth.context(self.handler(final)),final)
+    def test_untrusted_ambiguous_and_wrong_transport(self):
+        for xff in ['', '100.64.0.10', '100.64.0.10, '+CORE,
+                    '100.64.0.10, 127.0.0.1, '+CORE+', '+CORE,
+                    '100.64.0.10, 192.168.1.23, '+CORE,
+                    '100.64.0.10, 127.0.0.1, 172.30.32.9',
+                    '8.8.8.8, 127.0.0.1, '+CORE,
+                    '192.168.1.23, 127.0.0.1, '+CORE,
+                    '::ffff:100.64.0.10, 127.0.0.1, '+CORE,
+                    'fd7a:115c:a1e0::1234%eth0, 127.0.0.1, '+CORE,
+                    '100.64.0.10:1234, 127.0.0.1, '+CORE]:
+            self.assertIsNone(self.auth.context(self.handler(xff)),xff)
+        for proto in ['http','https,http','HTTPS','']:
+            self.assertIsNone(self.auth.context(self.handler(proto=proto)))
+        for host in ['attacker.ts.net',HOSTNAME+':443',HOSTNAME+'.',HOSTNAME+',evil',HOSTNAME.upper()]:
+            self.assertIsNone(self.auth.context(self.handler(host=host)))
+        for peer in ['127.0.0.1','172.30.32.1','100.64.0.10']:
+            self.assertIsNone(self.auth.context(self.handler(peer=peer)))
+        for name in ['X-Forwarded-For','X-Forwarded-Host','X-Forwarded-Proto','X-Ingress-Path']:
+            h=self.handler();h.headers[name]=h.headers[name]
+            self.assertIsNone(self.auth.context(h),name)
+    def test_serve_overwrite_then_pinned_append_accepts(self):
+        # Captured source semantics are represented, not a real Serve integration.
+        incoming={'X-Forwarded-For':'1.2.3.4, 127.0.0.1', 'X-Forwarded-Proto':'http'}
+        served={**incoming,'X-Forwarded-For':'100.64.0.10','X-Forwarded-Proto':'https'}
+        result=served['X-Forwarded-For']+', 127.0.0.1, '+CORE
+        self.assertEqual(self.auth.context(self.handler(result,proto=served['X-Forwarded-Proto'])),PREFIX)
+    def test_local_trusted_process_limitation_is_explicit(self):
+        # Network trust cannot distinguish another trusted host process from Serve.
+        # This prevents overstating this guard as cryptographic TLS attestation.
+        self.assertEqual(self.auth.context(self.handler()),PREFIX)
+
+    def test_valid_session_cannot_cross_wrong_transport(self):
+        auth=AppAuth(json.dumps(password_record(PASSWORD)), **ROUTE)
+        _,token=auth.login(PASSWORD,PREFIX)
+        for h in [self.handler('100.64.0.10, '+CORE), self.handler(proto='http'),
+                  self.handler(host='other.tailtest.ts.net'), self.handler(peer='127.0.0.1')]:
+            h.headers['Cookie']=COOKIE+'='+token
+            self.assertFalse(auth.authenticated(h))
+        h=self.handler();h.headers['Cookie']=COOKIE+'='+token
+        self.assertTrue(auth.authenticated(h))
+
+if __name__=='__main__': unittest.main()

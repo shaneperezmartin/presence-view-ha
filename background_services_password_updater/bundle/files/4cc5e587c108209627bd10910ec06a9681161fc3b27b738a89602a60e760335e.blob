@@ -1,0 +1,150 @@
+"""Independent app unlock. No credentials in options, logs, URLs or browser storage."""
+import hashlib
+import hmac
+import ipaddress
+import json
+import re
+import secrets
+import threading
+import time
+from http.cookies import SimpleCookie, CookieError
+
+COOKIE = '__Secure-background_services'
+PREFIX = re.compile(r'/api/hassio_ingress/[A-Za-z0-9_-]{16,256}')
+IDLE = 900
+ABSOLUTE = 28800
+
+
+def password_record(password):
+    if not isinstance(password, str) or not 12 <= len(password) <= 256:
+        raise ValueError('Use 12–256 characters')
+    salt = secrets.token_bytes(32)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=32768, r=8, p=1, maxmem=67108864)
+    return {'version': 1, 'salt': salt.hex(), 'digest': digest.hex()}
+
+
+class AppAuth:
+    def __init__(self, verifier, clock=time.monotonic, *, https_hostname="", ingress_core_peer=""):
+        self.https_hostname = ""
+        self.ingress_core_peer = None
+        # No inferred/default route: deployment must pin the verified Serve path.
+        try:
+            if (not isinstance(https_hostname, str) or len(https_hostname) > 253 or
+                not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+\.ts\.net", https_hostname) or
+                any(len(label) > 63 for label in https_hostname.split("."))):
+                raise ValueError()
+            peer = ipaddress.ip_address(ingress_core_peer)
+            if not peer.is_private or peer.is_loopback or peer.is_unspecified or peer.is_multicast:
+                raise ValueError()
+            self.https_hostname, self.ingress_core_peer = https_hostname, peer
+        except (ValueError, TypeError):
+            pass
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.sessions = {}
+        self.failures = []
+        self.record = None
+        # Never silently initialize a password or permit access on corrupt state.
+        try:
+            raw = verifier
+            if not isinstance(raw, str) or len(raw) > 1024: raise ValueError()
+            record = json.loads(raw)
+            if (len(raw) > 1024 or record.get('version') != 1 or
+                not re.fullmatch('[0-9a-f]{64}', record.get('salt', '')) or
+                not re.fullmatch('[0-9a-f]{128}', record.get('digest', ''))):
+                raise ValueError()
+            self.record = record
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def context(self, handler):
+        # The ingress proxy is the sole trusted browser peer. Localhost is NOT
+        # an authentication bypass. Duplicate/proxy-chain headers fail closed.
+        if not self.https_hostname or handler.client_address[0] != '172.30.32.2':
+            return None
+        def single(name):
+            values = handler.headers.get_all(name, [])
+            return values[0] if len(values) == 1 else ''
+        prefix = single('X-Ingress-Path')
+        if not PREFIX.fullmatch(prefix) or single('X-Forwarded-Proto') != 'https':
+            return None
+        # Core preserves raw X-Forwarded-Proto; that header alone proves nothing.
+        # Require the two *socket peers* appended on the right by Core and
+        # Supervisor. Direct LAN/tailnet HTTP cannot manufacture the loopback
+        # peer that Core appends, even when supplied headers are otherwise trusted.
+        # Serve overwrites the first entry with its tailnet client's actual IP.
+        if single('X-Forwarded-Host') != self.https_hostname:
+            return None
+        raw = single('X-Forwarded-For')
+        if len(raw) > 256:
+            return None
+        try:
+            parts = raw.split(',')
+            if len(parts) != 3:
+                return None
+            # Disallow scope IDs and ports; parse plain IP literals semantically.
+            if any('%' in part for part in parts):
+                return None
+            peers = [ipaddress.ip_address(part.strip()) for part in parts]
+            if (peers[1] != ipaddress.ip_address('127.0.0.1') or
+                peers[2] != self.ingress_core_peer):
+                return None
+            client = peers[0]
+            if not (client in ipaddress.ip_network('100.64.0.0/10') or
+                    client in ipaddress.ip_network('fd7a:115c:a1e0::/48')):
+                return None
+        except (ValueError, TypeError):
+            return None
+        return prefix
+
+    def cookie(self, token, prefix, clear=False):
+        return f'{COOKIE}={token}; Path={prefix}/; Secure; HttpOnly; SameSite=Strict; Max-Age={0 if clear else ABSOLUTE}'
+
+    def token(self, handler):
+        try:
+            values = handler.headers.get_all('Cookie', [])
+            if len(values) != 1: return ''
+            # Reject duplicate same-name cookies, not last-wins ambiguity.
+            if sum(part.strip().startswith(COOKIE + '=') for part in values[0].split(';')) != 1: return ''
+            cookie = SimpleCookie(); cookie.load(values[0])
+            token = cookie[COOKIE].value
+            return token if re.fullmatch('[A-Za-z0-9_-]{43}', token) else ''
+        except (KeyError, ValueError, CookieError):
+            return ''
+
+    def authenticated(self, handler, touch=True):
+        prefix = self.context(handler)
+        if not prefix: return False
+        token = self.token(handler)
+        now = self.clock()
+        with self.lock:
+            item = self.sessions.get(token)
+            if not item: return False
+            created, last, bound = item
+            if now-created >= ABSOLUTE or now-last >= IDLE or prefix != bound:
+                self.sessions.pop(token, None); return False
+            if touch: self.sessions[token] = (created, now, bound)
+            return True
+
+    def login(self, password, prefix):
+        # Shared attempt budget because HA ingress has one source address.
+        # Serial KDF bounds CPU/memory cost and blocks parallel guessing.
+        with self.lock:
+            now = self.clock()
+            self.failures = [t for t in self.failures if now-t < 300]
+            if len(self.failures) >= 5: return 429, None
+            self.failures.append(now)
+            record = self.record
+            if not record: return 503, None
+            if not isinstance(password, str) or not 12 <= len(password) <= 256: return 401, None
+            digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(record['salt']), n=32768, r=8, p=1, maxmem=67108864)
+            if not hmac.compare_digest(digest.hex(), record['digest']): return 401, None
+            # Keep the shared budget even after successful logins.
+            self.sessions = {k:v for k,v in self.sessions.items() if now-v[0] < ABSOLUTE and now-v[1] < IDLE}
+            if len(self.sessions) >= 16: return 429, None
+            token = secrets.token_urlsafe(32)
+            self.sessions[token] = (now, now, prefix)
+            return 200, token
+
+    def logout(self, handler):
+        with self.lock: self.sessions.pop(self.token(handler), None)

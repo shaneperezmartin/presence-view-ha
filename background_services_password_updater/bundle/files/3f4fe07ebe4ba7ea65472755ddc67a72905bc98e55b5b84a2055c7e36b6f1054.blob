@@ -1,0 +1,424 @@
+# Background Services
+
+## Version 0.2.7 — independent password lock (unreleased candidate)
+
+The app now requires a separate app password even after Home Assistant login.
+All web content and downloads are locked server-side. The old transcript-only
+bearer API is disabled, so existing scripted exports will stop working.
+Recording, MQTT controls, retention, installed slug, and existing options are
+preserved. The app starts locked until private password enrollment is complete.
+Phone-only initial enrollment is prepared: the HTTPS setup page generates a
+private one-time code and a separate approval hash for HA administrator
+Configuration. Only after that approval can the user choose the password.
+Never paste a password or setup code into an HA option or send one in chat.
+A verified HTTPS Home Assistant ingress route is mandatory; plain HTTP is not
+supported. See SECURITY.md for enrollment, security limits and required live
+verification. This candidate is not a deployment approval.
+
+The notes below describe historical releases. Their statements that the bearer
+API remains available do not apply to this 0.2.7 candidate.
+
+## Version 0.2.6 — selected audio or transcript ZIP batches
+
+Use the Files type, floor and optional dates, then **Download a batch**:
+choose the selected floor or both floors, and the current date range or all
+retained dates. **Preview batch** shows all matching files across every page,
+the selection, estimated uncompressed bytes, unfinished audio and unknown or
+unavailable date counts. **Download batch ZIP** opens separately and leaves the
+browser list in place. To request another download, preview again. Cancel a
+running transfer in the browser's downloads panel; Cancel preview only cancels
+the preview. Changes to inputs invalidate a previous preview. A fresh inventory
+is made when the ZIP starts, so counts and sizes can differ from the preview.
+
+Endpoints (normal authenticated HA ingress only):
+- `GET /api/batch-preview?kind=audio|transcripts&floor=upstairs|downstairs|both`
+- `GET /download-batch.zip?kind=audio|transcripts&floor=upstairs|downstairs|both`
+- Both accept optional `from=YYYY-MM-DD` and `through=YYYY-MM-DD`, inclusive New
+  York local days with DST. Empty date bounds are allowed. Unknown/duplicate
+  parameters, page parameters and arbitrary paths are rejected. Nonstandard
+  valid names use file mtime when no valid UTC filename date exists. Unknown
+  dates are included without date bounds and explicitly counted as excluded
+  when either bound is set. Empty selections produce a valid empty ZIP through
+  the endpoint; the UI disables a zero-file download.
+
+Audio bytes use ZIP_STORED (AAC is not recompressed). Original transcript bytes
+use light DEFLATE compression. ZIP64 is forced for source members. Sanitized
+meaningful names include a globally unique sequence and type/floor folders;
+manifest.json maps each member back to its exact original name and SHA256.
+AAC partial files and audio observed active at inventory/open time are marked
+**UNFINISHED SNAPSHOT** in names and manifest, and may not play completely.
+Transcripts may still need later text or finalized speaker labels.
+
+This is not an atomic backup. Capture and retention continue unchanged. Each
+file is capped at its inventory byte count. Replaced identities before opening
+are skipped; removed/unavailable files, shrinkage, read errors, observed
+size/mtime/ctime/link-count changes and replacement/removal after open are
+reported. A same-inode writer can race copying. SHA256 checks the exported
+bytes, not a stable source snapshot, and changes after each final check cannot
+be detected. `complete: true` means no observed unavailable, skipped, changed,
+truncated or failed entries, not that every source is finalized. A missing
+completion manifest or invalid ZIP means interruption and must not be treated
+as a completed export. New files after inventory wait for another export.
+
+Limits: one ZIP at a time, shared with the compatible old all-transcript ZIP;
+two concurrent inventories shared with file browsing; existing server limit
+of 16 client threads and queue of 16. A batch inventory scans at most 50,000
+entries (including irrelevant/unsafe entries), at most 20,000 retained regular
+files across the selected folders, at most 128 GiB selected source bytes, and
+10 seconds. Limits fail before a ZIP starts rather than silently truncating.
+Audio transfers have a 12-hour deadline; transcript transfers have a 30-minute
+deadline, checked at every read/write and manifest chunk. These limits are
+shown before download. Twelve hours allows a 20-GB batch at roughly 3.7 Mbps
+(plus overhead); slower links may need smaller date ranges. A blocked socket
+write times out within 15 seconds.
+One already-blocked write may run past the overall deadline by at most its
+socket timeout. Failed sockets are latched, so ZIP cleanup never retries them
+and multiplies idle timeouts. Resources and the export slot release on failure.
+I/O uses 64-KiB reads; content and ZIP output are never staged or buffered in
+full. Metadata memory scales only with the bounded inventory, member directory
+and completion report. No locks pause capture, retention or unrelated service.
+
+Normal ingress and descriptor-based directory/file checks restrict this to the
+archive's existing audio/transcripts upstairs/downstairs folders. Symlinks,
+hardlinks and nonregular files are rejected. No public port, extra credentials,
+uploads or broader bearer permissions are added. The separate transcript-only
+bearer API and original `/download-transcripts.zip` remain unchanged, as do
+individual downloads, paging, controls, settings, retention and private options.
+Generic package defaults still disable bearer export and leave its verifier
+empty. Downloaded copies are private and outside automatic retention.
+
+Local verification: aggregate Python tests and both synthetic-DOM Node suites,
+compile checks, unchanged bearer API probe, synthetic streaming/ZIP64/race and
+real loopback disconnect probes. Synthetic DOM checks do not establish actual
+browser layout, assistive-technology behavior or HA ingress/proxy throughput.
+Those require a signed-in post-install browser check; no denied cloud browser
+route is retried. No real captured data is used by these tests.
+
+# DJI Audio Archive
+
+## Version 0.2.5 - browse the full retained archive
+
+The **Files** section now shows every retained audio or transcript file for the
+selected floor, 50 per page, with **First**, **Previous**, **Next** and **Last**.
+Matching/retained totals and oldest/newest dates make the scope visible.
+Optional **From** and **Through** dates include the full selected New York local
+days, including 23-hour and 25-hour daylight-saving days. Clearing dates or
+changing floor/type starts at page one; Refresh reloads the current page.
+Files are newest-first by UTC capture start, with the name breaking ties.
+Unrecognized capture names use file modification time and are labeled as such;
+files with neither usable date remain visible without filters and are labeled
+unknown. Date coverage excludes those undated files.
+
+This browses only this app's private audio/transcript archive on the host,
+not unrelated Dell folders or other recording apps. Deleted files cannot be
+recovered by browsing. Audio retention is still seven days/20 GB total and
+transcript retention thirty days/500 MB total by default; existing configured
+caps remain effective. Archive contents are still excluded from app backups.
+Record/transcribe selections, status controls, processing, ZIP exports and the
+separate transcript-only bearer API are unchanged. No new port, credentials,
+permissions, dependencies or audio access through that bearer API are added.
+
+Counts describe the files observed during each fresh listing, not a frozen
+multi-page backup. Capture, labeling and retention can change them between
+pages. A disappearing entry is skipped and flagged; an obsolete final page is
+clamped to the new final page. Downloads open separately and a missing file
+shows a refresh notice, leaving the archive UI available. Rapid clicks/filter
+changes cannot replace newer results with a slow stale response.
+
+### Read-only listing contract
+
+`GET /api/files?kind=audio&floor=upstairs&page=1&page_size=50` returns an object
+with `files`, `page`, `page_size`, `pages`, matching `total`, `retained_total`,
+`oldest`, `newest`, `retained_oldest`, `retained_newest`, `timezone`,
+`skipped_unavailable` and `undated_files`. Date bounds `from=YYYY-MM-DD` and
+`through=YYYY-MM-DD` are optional and inclusive in America/New_York. `kind` is
+`audio` or `transcripts`; `floor` is `upstairs` or `downstairs`.
+
+Each row retains `name`, `display_name`, `bytes`, `active`, plus `started_utc`,
+`started_local` and `date_source` (`filename`, `modified`, or `unknown`). Scope
+objects contain `utc` and friendly `local` strings, or null for no dated files.
+An empty result has `page: 1`, `pages: 0`, `total: 0` and an empty file list.
+Requests with only the original kind/floor parameters still return the original
+array shape with at most 100 entries sorted by filename. Existing clients can
+opt into the new response by supplying page, page_size or date filters.
+
+All responses are no-store and ingress-only. Pages contain at most 100 rows;
+invalid, duplicate, unknown or oversized parameters receive HTTP 400. Scans
+run on HTTP workers, not the capture event loop, with at most two simultaneous
+scans, a ten-second enumeration budget and a 50,000-file safety ceiling per
+selection. Exceeding a bound fails explicitly with HTTP 503, never silently
+returns a partial catalogue or misleading total. File opens/listings pin the
+archive directory hierarchy on Linux and refuse symlinks, hardlinks, special
+files, traversal, other kinds/floors and unrelated file types. Original names
+are identifiers only; responses disclose no absolute paths or file contents.
+
+### Verification and deployment
+
+Run the complete synthetic Python suite with:
+`python -m unittest -v test_archive test_model_setup test_diarization test_presentation test_transcript_export test_transcript_api test_file_browser`
+
+Run navigation/concurrency/UI regression tests with `node --test test_files_ui.js`
+on a development host with Node. No new Node runtime dependency is needed in
+the app image. Python synthetic tests are included in the image self-test.
+Tests use temporary fixtures only, never HA, microphones or private recordings.
+
+Deploy only through an authorized app update. Preserve **all original effective
+options explicitly**, especially audio_source, Whisper/language settings,
+storage thresholds and the optional export settings. Generic defaults contain
+a placeholder audio source and a disabled export API, so replacing effective
+options with those defaults would break the existing setup. Preserve private
+app data and durable control state; do not turn on either capture control.
+Read back the version, all options and both off controls after the restart,
+then verify ingress browsing, existing downloads/export and idle capture.
+No archive migration, deletion, port change or credential rotation is required.
+
+## Version 0.2.4 - private transcript-only proxy export
+
+The existing browser UI, ZIP download, recording controls, labeling, retention,
+and individual downloads are unchanged. A separate **disabled-by-default**
+read-only export API can be called through an authenticated app-management HTTP
+proxy that forwards request headers. It uses the existing internal app port,
+not a published host port or browser ingress. No Core/Supervisor API grant,
+host networking, new OAuth connection, disabled protection, new dependency,
+audio access, or model access is added.
+
+### Configuration and authorization
+
+New options are `transcript_export_enabled: false` and
+`transcript_export_token_sha256: ""`. Enable only after review. Provision a new
+cryptographically random credential with at least 32 random bytes, encoded as
+43-128 base64url characters (`A-Z`, `a-z`, `0-9`, `_`, `-`, without padding).
+Keep the raw credential only in the authorized caller's private credential
+store. Put its lowercase 64-character SHA256 hex digest in the second option.
+The server requires exactly one `Authorization: Bearer <PRIVATE_TOKEN>` header,
+checks a SHA256 digest with constant-time comparison, and rechecks every
+request. Neither raw token nor digest appears in status, MQTT, or app logs.
+Length validation cannot prove randomness: never use the published test tokens.
+
+Disable the option or replace its digest and apply/restart the app to revoke
+access. Options are loaded at startup; changing the options file without
+applying/restarting is not a live revocation. Restart drops all inventory
+sessions. Configuration changes detected in-process also invalidate sessions.
+There is no credential-expiry scheduler: the operator must revoke it when the
+export is finished. The token grants access to private transcripts only. It
+must never be put in a URL, public source, shared document, or ordinary log.
+Do not forward it to any other service. Bearer credentials are replayable;
+use only the existing trusted local proxy/network. This API does not add TLS
+inside the HA app network, so protect access to that network and the proxy.
+The host gateway IP is shared and is **not** an identity or authorization rule.
+Spoofed ingress/forwarding headers do not grant this API access. Ingress itself
+does not bypass bearer authentication, and the bearer never bypasses ingress
+checks on existing control, status, audio, model, and download routes.
+
+Public configuration uses a neutral audio-source placeholder for new installs.
+An update must preserve the installation's existing options, private data,
+saved controls, and models. Do not replace live options with these defaults.
+
+### Protocol version 1
+
+Only GET routes under `/api/transcript-export/v1/` are available. Every request
+needs the bearer header, even when a snapshot ID is known. Each result is JSON
+with `Cache-Control: no-store`. The maximum encoded JSON body is 24 KiB,
+including escaped filenames; 16-KiB raw byte chunks become about 22 KiB of
+base64 JSON. An additionally JSON-escaped text wrapper remains below 50 KiB
+with room for normal proxy metadata. No response relies on proxy truncation.
+The caller must reject any proxy error, missing response, truncated text, or
+invalid JSON, never treat it as an empty file/page.
+
+Use the proxy's `request_headers` field as follows (placeholders only):
+
+```json
+{"Authorization": "Bearer <PRIVATE_TOKEN>"}
+```
+
+Send these paths using the existing archive app's internal HTTP proxy. Do not
+add a host port, change HA-MCP beta settings, or expose the service publicly.
+
+1. `GET /api/transcript-export/v1/inventory`
+   creates a session and returns its first page. Before returning, the server
+   captures fixed sizes, whole-file SHA256 and per-chunk hashes for **every**
+   regular `.txt` file catalogued in upstairs and downstairs. Any unsafe,
+   missing, oversized, or changed file has an explicit unavailable entry.
+   `scan_started_unix_ns` and `scan_finished_unix_ns` describe the capture
+   interval. This is not an atomic whole-filesystem snapshot; changes during
+   scanning are reported or reconciled, not hidden behind an atomic claim.
+2. `GET /api/transcript-export/v1/inventory?snapshot=<SNAPSHOT>&cursor=<NEXT_CURSOR>&limit=8`
+   gets each remaining page. Use the returned `next_cursor` until it is null.
+   Limits are 1-8 files, default 8. `expected_files` never changes within a
+   session; `inventory_complete: true` means both folders were fully scanned,
+   not that the client has downloaded all pages or files. Entries expose
+   source floor/name, exact filename bytes as base64, inventory size/time,
+   fixed snapshot size/SHA256, readiness and failure status. IDs are SHA256 of
+   floor plus exact filename bytes, so same-named files on different floors
+   cannot collide. Duplicate IDs fail the inventory rather than overwrite.
+3. `GET /api/transcript-export/v1/file?snapshot=<SNAPSHOT>&file_id=<FILE_ID>`
+   returns immutable snapshot metadata and the 16-KiB chunk size. It does not
+   recapture a changed file. The client should match IDs and digests to the
+   inventory. Filenames are metadata only: never join them to an output path.
+   Use the opaque file ID for local output names, keeping the mapping separately.
+4. `GET /api/transcript-export/v1/chunk?snapshot=<SNAPSHOT>&file_id=<FILE_ID>&offset=0`
+   returns exact raw bytes as `data_base64`, a chunk SHA256, fixed whole-file
+   SHA256/size, `bytes`, `next_offset`, and `eof`. Continue at `next_offset`.
+   Offsets must be multiples of 16384 and inside the file. Empty files accept
+   offset 0 and return zero bytes with `eof: true`. Repeat requests are safe.
+   Validate every offset, length, chunk digest, final size and whole-file digest.
+5. `GET /api/transcript-export/v1/verify?snapshot=<SNAPSHOT>&file_id=<FILE_ID>`
+   rehashes the fixed prefix and checks path/inode identity. Call it after
+   receiving and locally hashing each file. `complete: true` on this response
+   means that file's captured prefix was verified at `verified_unix_ns`, not
+   that later archive changes are impossible or that bytes reached the client.
+6. `GET /api/transcript-export/v1/summary?snapshot=<SNAPSHOT>`
+   rescans the catalog. `snapshot_complete` means every original file has a
+   successful individual verification. Overall `complete` additionally requires
+   no detected added, removed or changed entries since inventory. Counts and
+   `current_matches_inventory` make drift explicit. A live recording can grow
+   after its snapshot: its captured prefix can be valid while overall
+   `complete` is false. Save the summary and report that distinction. To obtain
+   later text/new files/final labels, make another export and reconcile by ID
+   and digest. Never claim one export includes future appends or replacements.
+7. `GET /api/transcript-export/v1/release?snapshot=<SNAPSHOT>`
+   releases in-memory inventory/hash bookkeeping only; no source files change.
+
+For example, the first result supplies `<SNAPSHOT>` and a first `<FILE_ID>`.
+Use those exact returned strings, not filesystem paths. No endpoint accepts a
+path, floor override, audio kind, uploaded content, or arbitrary filename.
+Unknown/duplicate parameters, malformed cursors, unsupported routes and invalid
+ranges fail explicitly. Authentication failure is 401; changes/unsafe entries
+are 409; removed sources or expired sessions are 410; resource bounds are 413;
+invalid ranges are 416; busy/session limits are 429; timeouts/unavailability
+are 503. Errors have fixed safe codes, never source bytes or exception details.
+
+### Snapshot races, limits and verification
+
+Each initial hash requires unchanged device/inode/size/mtime/ctime before and
+after hashing. A change between cataloguing and hashing marks that file
+unavailable; it is not silently recaptured at a later size. Later appends can
+be read only up to the captured size and are flagged. Each retrieved chunk
+must match its captured hash, so in-place edits cannot be mixed into a valid
+export. Final verification rejects changed prefixes. Retention removal,
+atomic speaker-label replacement, truncation, symlinks, hardlinks, FIFOs and
+other nonregular entries fail explicitly. The server does not hold transcript
+file descriptors between requests, pause retention, lock writers, or copy
+private transcript bodies to temporary files. It opens every directory
+component with directory FDs and no-symlink flags, then opens a confined regular
+file by its catalogued name. Linux secure-open support is mandatory.
+
+Limits are 50,000 `.txt` entries plus 50,000 ignored non-text entries per scan,
+256 MiB per file, 4 GiB fixed transcript bytes per session, two in-memory
+sessions, one export operation at a time, 15 seconds per operation, 30 minutes
+idle session expiry, and 24 hours absolute session lifetime. Exceeding a scan,
+time or aggregate size limit fails instead of returning a shortened inventory.
+Session bookkeeping consists of bounded metadata/hashes, not text bodies.
+There are at most 16 HTTP request workers, with a 15-second socket timeout;
+the existing ZIP transfer retains its 30-second idle/30-minute total limits.
+These are resource bounds, not hard real-time cancellation of a stalled kernel
+filesystem call. A large or slow archive can exceed the inventory time budget;
+that is an explicit failure requiring review, never a successful partial copy.
+
+The standard-library `transcript_client.retrieve(request_json, receive_file)`
+is a reference proxy-agnostic client. Supply an authenticated proxy adapter
+that returns only verified complete JSON, and a receiver that consumes and
+stores every raw chunk. It checks pagination, unique IDs, lengths, chunk and
+whole-file hashes, per-file verification, and snapshot completeness. It returns
+the reconciliation summary even when current archive drift makes overall
+`complete` false. Do not publish a master as complete without inspecting that
+summary and reconciling any relevant later changes. The reference client does
+not persist credentials, create output files, or log private text.
+
+Run the standalone, loopback-only synthetic retrieval probe with
+`python probe_transcript_api.py`. It creates temporary fixtures on both floors,
+including duplicate names, empty files, multi-chunk files and non-UTF8 bytes;
+retrieves them using a fabricated credential; verifies all bytes/digests; and
+prints only safe counts and response sizes. It does not contact Home Assistant,
+access microphones, pause capture, or use private data. Run all regression tests
+with `python -m unittest -v test_archive test_model_setup test_diarization test_presentation test_transcript_export test_transcript_api`.
+
+## Version 0.2.3 - download all saved transcripts
+
+Open **Settings > Apps > DJI Audio Archive > Open web UI**, then select
+**Download all transcripts (.zip)**. One ZIP contains every saved `.txt` file
+found in both floor folders, independent of the newest-100 list. No audio is
+included. This uses the same authenticated HA ingress and adds no port,
+credential, permission, cloud upload or persistent service.
+
+Entries have unique numbered, friendly New York date/time filenames within
+`upstairs/` and `downstairs/`. Text is a byte-for-byte snapshot, preserving
+original UTC metadata, words and speaker labels. The existing individual
+transcript download still offers formatted local timestamps inside the text.
+`manifest.json` maps ZIP names to original names, sizes and SHA256 digests.
+`README.txt` explains snapshots and verification. Empty archives produce a
+valid ZIP with an empty manifest and both floor folders.
+
+Recording and transcription continue during export. Each file is opened once
+and copied only up to its size at that instant. Appends, new files and later
+speaker labeling are available in a later download. Retention is unchanged;
+a file deleted before opening is explicitly marked skipped, and a file
+shortened during copying is marked truncated. `complete: true` requires zero
+skipped/truncated files. A missing manifest or invalid ZIP means interrupted
+export and must not be treated as a complete backup.
+
+Implementation streams ZIP64 with 64-KiB reads and no temporary transcript or
+ZIP files. Only one bulk export can run at a time; repeated clicks while busy
+show a retry message. An unresponsive client times out after 30 seconds, and a
+transfer has a 30-minute limit. At most 50,000 source entries are catalogued to
+bound ZIP-directory/manifest memory; exceeding that limit fails before any ZIP
+is sent rather than silently omitting files. This is well above the normal
+30-day ten-minute file count. Source content, controls, retention counters,
+models and capture processing are not changed by export.
+
+Endpoint: `GET /download-transcripts.zip`, no parameters. Authenticated ingress
+only, no caching, attachment response. Errors open separately so the archive
+control page stays in place. Do not share the downloaded private text unless
+authorized. Downloaded copies are outside automatic app retention.
+
+
+## Version 0.2.2 — readable local dates and downloads
+
+File lists and downloaded filenames now use New York local time, M-D-Y dates and 12-hour AM/PM times. Transcript downloads also format capture times, passage ranges and the speaker timeline; midnight and daylight-saving changes are handled explicitly. Both existing and new files use this presentation. On-disk UTC identifiers and original recognized text remain intact so speaker processing, chronological sorting and retention do not need a migration. Re-download an old transcript to obtain the new formatting. Copies already downloaded are unchanged. Audio downloads retain their original bytes and codec.
+
+
+
+
+## Version 0.2.1 — local speaker labels
+
+Community-1 now runs locally on CPU after each ten-minute transcript file closes (or when transcription is turned off). Left/Upstairs and Right/Downstairs stay separate. Labels are anonymous Speaker 1, Speaker 2, etc., reset for each floor/file, with no identity recognition or persistent voice profiles. A passage spanning several speakers is marked Mixed speakers; this is passage-level attribution, not exact word alignment. Each completed file also contains a speaker timeline. Model errors, queue overflow or shutdown preserve the plain transcript with a notice.
+
+Transcription-only mode now holds up to ten minutes of mono PCM per floor in memory for diarization (19.2 MB per floor). There are at most two queued labeling files and one active worker; buffers are bounded. These transient audio buffers are not saved to disk. Speech-to-text still uses local Whisper and short bounded passages. Two CPU threads, lower scheduling priority, a six-GiB virtual-memory ceiling and four-minute job timeout limit the labeling worker. Pending audio/labels can be lost on restart; saved control choices still resume. The original audio recording and retention rules are unchanged.
+
+Pinned runtime: pyannote.audio4.0.7, CPU-only torch/torchaudio2.9.1, torchcodec0.8.1. Hugging Face offline mode, pyannote telemetry disabled, SDK telemetry disabled, no auth tokens in the worker, and Python network audit rejection. The pinned model files are rechecked before every model load. No cloud inference or speaker embeddings are saved. Raw audio, recognized words and speaker timelines are never printed to app logs or sent through MQTT.
+
+Use **Run model check** with both capture controls off for a one-minute generated-silence check. It does not open a microphone or save an archive. Reported seconds and peak worker memory measure that synthetic test; they are not a multi-speaker accuracy or full ten-minute performance guarantee. Then use a brief user-controlled transcription-only test, turn it off, and verify each floor's text and labels after processing finishes. No real capture is automatically started by installation.
+
+Additional authenticated ingress endpoints: `GET /api/diarization` returns safe counters/status only; `POST /api/diarization-test` with `{"test":"synthetic"}` and `X-Archive-Control: 1` starts only the fixed generated-silence test while capture/processing is idle. No arbitrary input, uploaded audio or code accepted.
+
+Earlier version notes below describe the original release and download-only phase; this section supersedes their statements that speaker-label runtime is absent.
+
+Local app for a DJI stereo USB receiver. Left is Upstairs; right is Downstairs. The two floors are saved in separate files. This app does not start or restore Assist and does not alter go2rtc.
+
+Open **Settings > Apps > DJI Audio Archive > Open web UI**. The two controls are **Record audio** and **Transcribe speech**. Both start off on a new installation. Each acknowledged choice is saved to the app's private disk data and resumes after restart. The app itself starts at boot in standby when both choices are off. Actual capture status is displayed separately from the requested enabled state. Native MQTT creates the same two controls and capture-status indicators in Home Assistant; no dashboard edits are included.
+
+Audio: separate mono AAC speech recordings, 16 kHz/64 kbps per floor, ten-minute segments, seven-day retention. Transcripts: local Whisper, separate ten-minute text files for each floor, thirty-day retention. Switching off or recovering from an interruption can create a shorter file. Transcription can continue finishing already captured passages after its control is off. Filenames/timestamps are UTC. Recognition may be inaccurate. Speaker diarization is not included in version 0.1.0; it awaits the user's model-access setup and a separate verified implementation.
+
+The recorder has a 20 GB total cap; text has a 500 MB total cap. Closed files older than their retention period, or the oldest closed files above the applicable cap, are removed once a minute and on startup. Active files are protected. Capture pauses below 10 GB free. Retention continues with both controls off. Downloads are separate copies outside automatic retention. App backup exclusion patterns omit archive/model/temp directories; configuration and durable control state are retained. Exclusion archive contents require separate validation before making broader retention guarantees.
+
+With recording off, transcription's short PCM buffers exist only in bounded process memory. Raw audio is not saved to disk. A power outage can lose pending passages; automatic restart does not recover sound during the outage. A stopped transmitter or missing USB receiver prevents capture even when a control is enabled. Runtime faults and skipped intervals are reported.
+
+Access: the existing UI and control routes are HA ingress only; the optional
+0.2.4 transcript API uses its separate bearer credential. No published host port. Shared HA audio input and existing internal MQTT/Whisper services. No Home Assistant administrator API, host network, Docker socket, filesystem mounts, external transcription API, or cloud archive. The app never logs recordings or recognized text. MQTT messages contain control/status data only. Do not add credentials to URLs or change HA-MCP beta settings.
+
+Version 0.1.1 adds **Set up speaker labels** in the web UI. Paste a fine-grained read token for `pyannote/speaker-diarization-community-1` and click **Download model**. Both capture controls must be off. The token travels in the POST body and an anonymous process pipe; it is not stored in options, environment variables, command arguments, files, or logs. A separate worker exits after the download or ten minutes. No Hugging Face login/token-save command is called. The form clears on submission. The existing HA ingress connection carries the token; Hugging Face downloads use HTTPS. No audio is sent to Hugging Face.
+
+Eight model/documentation files are pinned to revision `3533c8cf8e369892e6b79ff1bf80f7b0286a54ee`; their sizes and published SHA256 or Git blob digests must match before the model download is marked complete. Failed/interrupted downloads can be retried with the token entered again. Downloads do not enable capture, load executable model weights, or enable speaker labeling. The local diarization runtime and integration still require implementation and validation. Do not interpret "downloaded" as working diarization.
+
+Supported private app API, through authenticated ingress:
+- `GET /api/model-setup`: fixed safe progress/status only, no token or arbitrary exception text.
+- `POST /api/model-setup` with JSON `{"token":"USER_ENTERS_PRIVATELY"}` and `X-Archive-Control: 1`: isolated one-time pinned model download. Do not send credentials through chat, query strings, or agent tool arguments. Read status after an unknown outcome; do not blindly resubmit.
+- `GET /api/status`: controls, actual capture state, bounded queue counters, storage and errors; no transcript contents.
+- `GET /api/diagnostics`: read-only exact audio-source inventory and Wyoming Describe check; never opens the microphone.
+- `GET /api/files?kind=audio|transcripts&floor=upstairs|downstairs`: up to 100 recent file names/sizes; no file contents.
+- `GET /download/{kind}/{floor}/{name}`: download one confined archive file.
+- `POST /api/control` with JSON `{"control":"recording"|"transcription","enabled":true|false}` and `X-Archive-Control: 1`: persist a choice, then enact it. Read back after an unknown outcome.
+- `POST /api/self-test` with JSON `{"test":"synthetic"}` and `X-Archive-Control: 1`: bounded unit/codec tests in temporary storage; only available when both controls are off. Does not open the microphone or contact speech services. No arbitrary commands or uploaded code accepted.
+
+Recovery: turn both controls off, stop this app and set its Start on boot to off. Preserve app data until deciding whether it should be removed. Do not restore the whole HA backup to reverse this app alone. Corrupt saved control state fails closed and requires inspection; it is never silently overwritten with an on state.
+

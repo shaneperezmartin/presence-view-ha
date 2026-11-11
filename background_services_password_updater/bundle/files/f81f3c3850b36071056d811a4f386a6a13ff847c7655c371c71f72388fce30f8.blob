@@ -1,0 +1,83 @@
+"""One-time enrollment authorized by a private HA administrator option.
+
+Approval is SHA256(random browser code):absolute expiry, never the code itself.
+Only an exclusive durable verifier file enables login. No overwrite/reset API.
+"""
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import time
+
+from app_auth import password_record
+
+
+class Enrollment:
+    def __init__(self, auth, path, approval='', *, configured_verifier='', clock=time.time):
+        self.auth, self.path, self.clock = auth, Path(path), clock
+        self.approval = approval
+        self.blocked = bool(configured_verifier) or auth.record is not None  # Corrupt legacy config also blocks.
+        self.attempts = []
+        try:
+            # lexists includes dangling links; no missing-file fallback on corruption.
+            if os.path.lexists(self.path):
+                self.blocked = True
+                self.auth.record = None
+                fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, 'r') as f:
+                    info = os.fstat(f.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > 1024:
+                        return
+                    raw = f.read(1025)
+                from app_auth import AppAuth
+                self.auth.record = AppAuth(raw).record
+        except (OSError, UnicodeError):
+            self.blocked = True
+            self.auth.record = None
+
+    def enroll(self, code, password, confirmation):
+        with self.auth.lock:
+            now = self.clock()
+            if self.blocked or os.path.lexists(self.path):
+                return 409
+            match = re.fullmatch(r'([0-9a-f]{64}):([0-9]{10})', self.approval) if isinstance(self.approval, str) else None
+            if not match or not now < int(match[2]) <= now + 1800:
+                return 403
+            self.attempts = [t for t in self.attempts if now-t < 300]
+            if len(self.attempts) >= 5:
+                return 429
+            self.attempts.append(now)
+            if (not isinstance(code, str) or not re.fullmatch(r'[0-9a-f]{64}', code) or
+                not hmac.compare_digest(hashlib.sha256(code.encode('ascii')).hexdigest(), match[1])):
+                return 403
+            if (not isinstance(password, str) or not 12 <= len(password) <= 256 or
+                password != confirmation):
+                return 400
+            record = password_record(password)
+            if not self.clock() < int(match[2]) <= self.clock() + 1800:
+                return 403
+            try:
+                # O_EXCL prevents racing writers and symlink replacement. A crash
+                # or failed sync leaves the file locked closed for admin recovery.
+                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                self.blocked = True
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(record, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except OSError:
+                self.auth.record = None
+                return 503
+            self.auth.record = record
+            self.auth.sessions.clear()
+            self.auth.failures.clear()
+            self.approval = ''
+            return 201

@@ -1,0 +1,463 @@
+"""Local-only archive primitives. Never log captured audio or recognized words."""
+from __future__ import annotations
+import array
+import asyncio
+from collections import Counter, deque
+from datetime import datetime, timezone
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import sys
+import time
+import uuid
+from diarization import Diarizer
+
+RATE = 16000
+FRAME_SAMPLES = 320
+FRAME_BYTES = 640
+SEGMENT = 600
+FLOORS = ("upstairs", "downstairs")
+DAY = 86400
+
+
+def split_stereo(pcm):
+    if len(pcm) % 4:
+        raise ValueError("Incomplete stereo sample")
+    a = array.array("h", pcm)
+    if sys.byteorder != "little":
+        a.byteswap()
+    left, right = a[0::2], a[1::2]
+    if sys.byteorder != "little":
+        left.byteswap(); right.byteswap()
+    return left.tobytes(), right.tobytes()
+
+
+def stamp(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="milliseconds")
+
+
+class DurableState:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.value = {"recording": False, "transcription": False}
+        self.error = None
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text())
+                if set(data) != set(self.value) or any(type(v) is not bool for v in data.values()):
+                    raise ValueError("Invalid state")
+                self.value = data
+            except (ValueError, OSError):
+                self.error = "Saved controls unreadable; capture blocked"
+
+    def set(self, key, enabled):
+        if self.error:
+            raise RuntimeError(self.error)
+        if key not in self.value or type(enabled) is not bool:
+            raise ValueError("Invalid control")
+        updated = {**self.value, key: enabled}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".new")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(updated, f)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+        if os.name != "nt":
+            fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(fd)
+            finally: os.close(fd)
+        self.value = updated
+
+
+class Archive:
+    def __init__(self, root, audio_limit=20_000_000_000, text_limit=500_000_000):
+        if Path(root).is_symlink():
+            raise ValueError("Archive root must not be a symlink")
+        self.root = Path(root).resolve()
+        self.limits = {"audio": audio_limit, "transcripts": text_limit}
+        self.active = Counter()
+        for kind in self.limits:
+            for floor in FLOORS:
+                folder = self.root / kind / floor
+                folder.mkdir(parents=True, exist_ok=True)
+                if folder.is_symlink() or not folder.resolve().is_relative_to(self.root):
+                    raise ValueError("Archive directory must be private and local")
+
+    def new(self, kind, floor, epoch, suffix):
+        if kind not in self.limits or floor not in FLOORS:
+            raise ValueError("Invalid destination")
+        name = datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        return self.root / kind / floor / (name + "_" + uuid.uuid4().hex[:8] + suffix)
+
+    def safe(self, kind, floor, name):
+        if kind not in self.limits or floor not in FLOORS or Path(name).name != name or "\\" in name:
+            raise ValueError("Invalid file")
+        path = self.root / kind / floor / name
+        if path.is_symlink() or not path.resolve().is_relative_to(self.root):
+            raise ValueError("Invalid file")
+        return path
+
+    def files(self, kind):
+        result = []
+        for floor in FLOORS:
+            folder = self.root / kind / floor
+            if folder.is_symlink():
+                raise ValueError("Invalid archive directory")
+            for p in folder.iterdir():
+                if p.is_symlink() or not p.is_file():
+                    continue
+                if kind == "audio" and not (p.name.endswith(".aac") or p.name.endswith(".aac.part")):
+                    continue
+                if kind == "transcripts" and p.suffix != ".txt":
+                    continue
+                result.append(p)
+        return result
+
+    def cleanup(self, now=None):
+        now = time.time() if now is None else now
+        removed = 0
+        for kind, days in (("audio", 7), ("transcripts", 30)):
+            paths = sorted(self.files(kind), key=lambda p: p.stat().st_mtime)
+            total = sum(p.stat().st_size for p in paths)
+            for path in paths:
+                st = path.stat()
+                if self.active[path] > 0:
+                    continue
+                if st.st_mtime <= now - days * DAY or total > self.limits[kind]:
+                    # Paths are confined above; never recursively delete or follow symlinks.
+                    path.unlink()
+                    total -= st.st_size
+                    removed += 1
+        return removed
+
+    def append(self, path, value):
+        with path.open("a", encoding="utf-8") as f:
+            f.write(value)
+            f.flush(); os.fsync(f.fileno())
+
+
+class AudioSegment:
+    def __init__(self, archive, floor):
+        self.archive, self.floor = archive, floor
+        self.proc = self.path = None
+        self.samples = 0
+
+    async def feed(self, pcm, epoch):
+        if self.proc is not None and self.samples >= RATE * SEGMENT:
+            await self.close()
+        if self.proc is None:
+            self.path = self.archive.new("audio", self.floor, epoch, ".aac.part")
+            self.archive.active[self.path] += 1
+            self.proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-n",
+                "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", "pipe:0",
+                "-c:a", "aac", "-b:a", "64k", "-f", "adts", str(self.path),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            self.samples = 0
+        self.proc.stdin.write(pcm)
+        await asyncio.wait_for(self.proc.stdin.drain(), 3)
+        self.samples += len(pcm) // 2
+
+    async def close(self):
+        proc, path = self.proc, self.path
+        self.proc = self.path = None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+            try: await asyncio.wait_for(proc.wait(), 8)
+            except asyncio.TimeoutError:
+                proc.kill(); await proc.wait()
+            if path.exists() and path.stat().st_size:
+                with path.open("rb") as f: os.fsync(f.fileno())
+                path.rename(path.with_suffix(""))
+        finally:
+            self.archive.active[path] -= 1
+
+
+class SpeechGate:
+    """20 ms VAD with pre-roll and bounded utterances; no disk audio buffer."""
+    def __init__(self, vad):
+        self.vad = vad
+        self.pre = deque(maxlen=15)
+        self.votes = deque(maxlen=5)
+        self.frames = []
+        self.voiced = self.quiet = 0
+        self.start = 0.0
+
+    def feed(self, pcm, epoch):
+        speech = self.vad.is_speech(pcm, RATE)
+        if not self.frames:
+            self.pre.append((pcm, epoch))
+            self.votes.append(speech)
+            if sum(self.votes) >= 3:
+                self.frames = [x[0] for x in self.pre]
+                self.start = self.pre[0][1]
+                self.voiced = sum(self.votes)
+                self.pre.clear(); self.votes.clear()
+            return None
+        self.frames.append(pcm)
+        self.voiced += bool(speech)
+        self.quiet = 0 if speech else self.quiet + 1
+        if self.quiet >= 30 or len(self.frames) >= 750:
+            return self.finish(epoch + .02)
+        return None
+
+    def finish(self, end):
+        result = None
+        if self.frames and self.voiced >= 15:
+            result = (b"".join(self.frames), self.start, end)
+        self.frames = []; self.voiced = self.quiet = 0
+        self.pre.clear(); self.votes.clear()
+        return result
+
+
+async def wyoming_event(writer, kind, data=None, payload=b""):
+    header = {"type": kind}
+    if data is not None: header["data"] = data
+    if payload: header["payload_length"] = len(payload)
+    writer.write(json.dumps(header).encode() + b"\n" + payload)
+    await writer.drain()
+
+
+async def read_event(reader):
+    line = await reader.readline()
+    if not line or len(line) > 65536:
+        raise ValueError("Invalid Wyoming header")
+    event = json.loads(line)
+    for key in ("data_length", "payload_length"):
+        n = event.get(key, 0)
+        if type(n) is not int or not 0 <= n <= 1_000_000:
+            raise ValueError("Invalid Wyoming length")
+        if n:
+            value = await reader.readexactly(n)
+            if key == "data_length":
+                event["data"] = {**event.get("data", {}), **json.loads(value)}
+    return event
+
+
+async def transcribe(pcm, host, port, language):
+    async with asyncio.timeout(90):
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            fmt = {"rate": RATE, "width": 2, "channels": 1}
+            await wyoming_event(writer, "transcribe", {"language": language})
+            await wyoming_event(writer, "audio-start", fmt)
+            for at in range(0, len(pcm), 8192):
+                await wyoming_event(writer, "audio-chunk", fmt, pcm[at:at+8192])
+            await wyoming_event(writer, "audio-stop")
+            while True:
+                response = await read_event(reader)
+                if response["type"] == "transcript":
+                    return str(response.get("data", {}).get("text", "")).strip()
+                if response["type"] == "error":
+                    raise RuntimeError("Speech service returned an error")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+class Controller:
+    def __init__(self, data, options):
+        import webrtcvad
+        self.data, self.options = Path(data), options
+        self.state = DurableState(self.data / "controls.json")
+        self.archive = Archive(self.data / "archive", options["audio_limit_gb"] * 10**9,
+                               options["transcript_limit_mb"] * 10**6)
+        self.lock = asyncio.Lock()
+        self.encoders = [AudioSegment(self.archive, floor) for floor in FLOORS]
+        self.gates = [SpeechGate(webrtcvad.Vad(2)) for _ in FLOORS]
+        self.text_paths = [None, None]
+        self.text_samples = 0
+        self.queue = asyncio.Queue(maxsize=40)
+        self.proc = None
+        self.running = True
+        self.recording_active = self.transcription_active = False
+        self.error = self.state.error
+        self.last_capture = None
+        self.completed_utterances = self.failed_utterances = 0
+        self.on_change = lambda: None
+        self.diarizer = Diarizer(self)
+
+    def status(self):
+        return {"version": "0.2.7", **self.state.value,
+                "recording_active": self.recording_active,
+                "transcription_active": self.transcription_active,
+                "capture_process_running": self.proc is not None and self.proc.returncode is None,
+                "queue_length": self.queue.qsize(), "last_capture": self.last_capture,
+                "completed_utterances": self.completed_utterances, "failed_utterances": self.failed_utterances,
+                "error": self.error, "diarization": (
+                    self.diarizer.error or 'Local speaker labeling installed; finalizes after each file closes'
+                    if self.diarizer.ready() else 'Model download required; transcripts have no speaker labels'),
+                "speaker_processing": self.diarizer.status(),
+                "segment_minutes": 10, "audio_retention_days": 7, "transcript_retention_days": 30,
+                "free_bytes": shutil.disk_usage(self.data).free,
+                "audio_limit_gb": self.options["audio_limit_gb"],
+                "transcript_limit_mb": self.options["transcript_limit_mb"],
+                "minimum_free_gb": self.options["minimum_free_gb"]}
+
+    async def diagnostics(self):
+        result = {"microphone_opened": False, "input_present": False, "whisper_reachable": False}
+        try:
+            proc = await asyncio.create_subprocess_exec("pactl", "list", "short", "sources",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            output, _ = await asyncio.wait_for(proc.communicate(), 8)
+            result["input_present"] = self.options["audio_source"] in output.decode(errors="replace")
+        except Exception: pass
+        writer = None
+        try:
+            async with asyncio.timeout(8):
+                reader, writer = await asyncio.open_connection(self.options["whisper_host"], self.options["whisper_port"])
+                await wyoming_event(writer, "describe")
+                event = await read_event(reader)
+                result["whisper_reachable"] = event["type"] == "info" and bool(event.get("data", {}).get("asr"))
+        except Exception: pass
+        finally:
+            if writer:
+                writer.close()
+                await writer.wait_closed()
+        return result
+
+    async def set_control(self, key, enabled):
+        async with self.lock:
+            if enabled and self.diarizer.test_task and not self.diarizer.test_task.done():
+                raise RuntimeError("Wait for the synthetic model test to finish")
+            self.state.set(key, enabled)
+            if not enabled:
+                if key == "recording":
+                    for encoder in self.encoders: await encoder.close()
+                    self.recording_active = False
+                elif key == "transcription":
+                    self.close_text(time.time())
+                    self.transcription_active = False
+            if not any(self.state.value.values()) and self.proc is not None and self.proc.returncode is None:
+                self.proc.terminate()
+        self.on_change()
+        return self.status()
+
+    def enqueue(self, i, utterance):
+        if utterance is None or self.text_paths[i] is None:
+            return
+        path = self.text_paths[i]
+        pcm, start, end = utterance
+        if self.queue.full():
+            self.failed_utterances += 1
+            self.error = "Transcription is falling behind; an interval was skipped"
+            self.archive.append(path, f"[{stamp(start)} - {stamp(end)}] [Skipped: processing queue full]\n")
+            return
+        self.archive.active[path] += 1
+        self.queue.put_nowait((path, pcm, start, end))
+
+    def close_text(self, epoch):
+        for i, path in enumerate(self.text_paths):
+            self.enqueue(i, self.gates[i].finish(epoch))
+            if path:
+                self.archive.append(path, f"\nCapture closed: {stamp(epoch)}. Queued speech may finish below.\n")
+                self.diarizer.finish(i, path)
+                self.archive.active[path] -= 1
+        self.text_paths = [None, None]
+        self.text_samples = 0
+
+    def feed_text(self, channels, epoch):
+        if self.text_samples >= RATE * SEGMENT:
+            self.close_text(epoch)
+        if self.text_paths[0] is None:
+            for i, floor in enumerate(FLOORS):
+                path = self.archive.new("transcripts", floor, epoch, ".txt")
+                self.text_paths[i] = path
+                self.archive.active[path] += 1
+                self.archive.append(path, f"DJI {floor.title()} | capture start {stamp(epoch)}\n"
+                                    "Local Whisper transcription. Anonymous speaker labels pending file completion.\n"
+                                    "Labels reset for each floor/file; interruption can leave plain text only.\n"
+                                    "Automatic text may contain errors. Timestamps identify captured passages.\n\n")
+        for i, channel in enumerate(channels):
+            self.enqueue(i, self.gates[i].feed(channel, epoch))
+        self.diarizer.feed(channels, epoch)
+        self.text_samples += FRAME_SAMPLES
+
+    async def capture_loop(self):
+        while self.running:
+            if self.state.error or not any(self.state.value.values()):
+                await asyncio.sleep(.2); continue
+            if shutil.disk_usage(self.data).free < self.options["minimum_free_gb"] * 10**9:
+                self.error = "Capture paused: minimum free disk space reached"
+                self.on_change(); await asyncio.sleep(5); continue
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-f", "pulse", "-i", self.options["audio_source"],
+                    "-ac", "2", "-ar", str(RATE), "-f", "s16le", "pipe:1",
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+                self.proc = proc
+                frames = 0
+                while self.running and any(self.state.value.values()):
+                    pcm = await asyncio.wait_for(proc.stdout.readexactly(FRAME_BYTES * 2), 10)
+                    epoch = time.time() - .02
+                    async with self.lock:
+                        if not any(self.state.value.values()): break
+                        if frames % 50 == 0 and shutil.disk_usage(self.data).free < self.options["minimum_free_gb"] * 10**9:
+                            raise OSError("Disk reserve reached")
+                        channels = split_stereo(pcm)
+                        if self.state.value["recording"]:
+                            for enc, channel in zip(self.encoders, channels): await enc.feed(channel, epoch)
+                        if self.state.value["transcription"]: self.feed_text(channels, epoch)
+                        self.recording_active = self.state.value["recording"]
+                        self.transcription_active = self.state.value["transcription"]
+                        self.last_capture = stamp(epoch)
+                        if self.error and self.error.startswith("Capture "):
+                            self.error = None
+                    frames += 1
+                    if frames % 250 == 0: self.on_change()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if any(self.state.value.values()):
+                    self.error = "Capture interrupted; checking microphone/storage and retrying"
+            finally:
+                if proc is not None and proc.returncode is None:
+                    proc.terminate()
+                    try: await asyncio.wait_for(proc.wait(), 5)
+                    except asyncio.TimeoutError:
+                        proc.kill(); await proc.wait()
+                self.proc = None
+                async with self.lock:
+                    for encoder in self.encoders: await encoder.close()
+                    self.close_text(time.time())
+                    self.recording_active = self.transcription_active = False
+                self.on_change()
+            if any(self.state.value.values()): await asyncio.sleep(3)
+
+    async def speech_loop(self):
+        while True:
+            path, pcm, start, end = await self.queue.get()
+            try:
+                text = await transcribe(pcm, self.options["whisper_host"], self.options["whisper_port"], self.options["language"])
+                if text:
+                    text = " ".join(text.split())
+                    self.archive.append(path, f"[{stamp(start)} - {stamp(end)}] {text}\n")
+                self.completed_utterances += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.failed_utterances += 1
+                self.error = "A speech passage could not be transcribed; see interval marker in file"
+                self.archive.append(path, f"[{stamp(start)} - {stamp(end)}] [Transcription unavailable]\n")
+            finally:
+                self.archive.active[path] -= 1
+                self.queue.task_done()
+                self.on_change()
+
+    async def maintenance_loop(self):
+        while self.running:
+            try:
+                self.archive.cleanup()
+            except Exception:
+                self.error = "Archive cleanup failed; review storage before continuing"
+            self.on_change()
+            await asyncio.sleep(60)
+

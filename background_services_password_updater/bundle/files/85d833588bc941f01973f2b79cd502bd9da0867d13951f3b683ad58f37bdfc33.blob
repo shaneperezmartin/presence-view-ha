@@ -1,0 +1,321 @@
+"""Synthetic archive/loopback fixtures only; no HA, capture or private files."""
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+import http.client
+from http.server import ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import tempfile
+import threading
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+from urllib.parse import urlencode, quote
+
+from archive import Archive, DurableState
+import file_browser as browser
+from server import Handler
+from transcript_api import TranscriptAPI, PREFIX
+
+
+class FileBrowserTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.archive = Archive(Path(self.temp.name) / "archive")
+
+    def put(self, stamp="2026-11-08T12:00:00+00:00", floor="upstairs", kind="audio", name=None, content=b"synthetic"):
+        name = name or datetime.fromisoformat(stamp).strftime("%Y%m%dT%H%M%S.%fZ") + "_abcdef12" + (".aac" if kind == "audio" else ".txt")
+        path = self.archive.root / kind / floor / name
+        path.write_bytes(content)
+        return path
+
+    def listing(self, **args):
+        return browser.list_files(self.archive, browser.selection(urlencode({"page": 1, **args})))
+
+    def test_all_121_each_of_four_selections_pages_and_totals(self):
+        start = datetime(2026, 11, 6, tzinfo=timezone.utc)
+        for floor in ("upstairs", "downstairs"):
+            for kind in ("audio", "transcripts"):
+                expected = []
+                for i in range(121):
+                    expected.append(self.put((start + timedelta(minutes=10*i)).isoformat(), floor, kind).name)
+                names = []
+                for page in range(1, 4):
+                    response = self.listing(floor=floor, kind=kind, page=page)
+                    self.assertEqual((response["total"], response["retained_total"], response["pages"]), (121, 121, 3))
+                    self.assertEqual(len(response["files"]), 21 if page == 3 else 50)
+                    names += [row["name"] for row in response["files"]]
+                    self.assertLess(len(json.dumps(response)), 100000)
+                self.assertEqual(names, sorted(expected, reverse=True))
+                self.assertEqual(self.listing(floor=floor, kind=kind, page=999)["page"], 3)
+                self.assertEqual(response["oldest"]["utc"], start.isoformat())
+                self.assertIn("EST", response["newest"]["local"])
+
+    def test_legacy_shape_first_100_and_original_keys(self):
+        for i in range(103):
+            self.put(name=f"fixture-{i:04}.aac")
+        response = browser.list_files(self.archive, browser.selection("kind=audio&floor=upstairs"))
+        self.assertIsInstance(response, list)
+        self.assertEqual(len(response), 100)
+        self.assertEqual(set(response[0]), {"name", "display_name", "bytes", "active"})
+        self.assertEqual(response[0]["name"], "fixture-0102.aac")
+
+    def test_empty_and_filter_empty_scope_and_retained_totals(self):
+        empty = self.listing(page=99)
+        self.assertEqual((empty["page"], empty["pages"], empty["total"], empty["files"]), (1, 0, 0, []))
+        self.assertIsNone(empty["oldest"])
+        self.put()
+        filtered = self.listing(**{"from": "2026-11-09"})
+        self.assertEqual((filtered["total"], filtered["retained_total"]), (0, 1))
+        self.assertIsNone(filtered["oldest"])
+        self.assertIsNotNone(filtered["retained_oldest"])
+
+    def test_ny_midnight_and_fall_dst_25_hour_day(self):
+        values = ["2026-11-01T03:59:59+00:00", "2026-11-01T04:00:00+00:00",
+                  "2026-11-01T05:30:00+00:00", "2026-11-01T06:30:00+00:00",
+                  "2026-11-02T04:59:59+00:00", "2026-11-02T05:00:00+00:00"]
+        for stamp in values:
+            self.put(stamp)
+        result = self.listing(**{"from": "2026-11-01", "through": "2026-11-01"})
+        self.assertEqual((result["total"], result["retained_total"]), (4, 6))
+        local = " ".join(row["started_local"] for row in result["files"])
+        self.assertIn("1:30:00 AM EDT", local)
+        self.assertIn("1:30:00 AM EST", local)
+        self.assertIn("12:00:00 AM EDT", result["oldest"]["local"])
+        self.assertIn("11:59:59 PM EST", result["newest"]["local"])
+
+    def test_spring_dst_23_hour_day_and_leap_day(self):
+        for stamp in ("2026-03-08T04:59:59+00:00", "2026-03-08T05:00:00+00:00",
+                      "2026-03-09T03:59:59+00:00", "2026-03-09T04:00:00+00:00"):
+            self.put(stamp)
+        result = self.listing(**{"from": "2026-03-08", "through": "2026-03-08"})
+        self.assertEqual(result["total"], 2)
+        self.assertIn("EST", result["oldest"]["local"])
+        self.assertIn("EDT", result["newest"]["local"])
+        browser.selection("from=2024-02-29")
+
+    def test_strict_validation_and_page_bound(self):
+        for query in ("kind=all", "floor=../upstairs", "page=0", "page=-1", "page=1.5",
+                      "page=1&page=2", "page=", "page=9999999999", "page_size=101", "page_size=0",
+                      "from=2026-02-29", "from=0000-01-01", "from=11-1-2026", "from=2026-1-1",
+                      "from=2026-11-10&through=2026-11-09", "path=/etc", "kind", "floor=upstairs&x=1",
+                      "from=%ff", "floor=" + "a"*2048):
+            with self.subTest(query=query[:80]), self.assertRaises((ValueError, UnicodeError)):
+                browser.selection(query)
+        self.assertEqual(browser.selection("page_size=100").page_size, 100)
+        self.assertFalse(browser.selection("from=&through=").legacy)
+
+    def test_malformed_name_date_fallback_and_friendly_labels(self):
+        path = self.put(name="20269999T120000.000000Z_aabbccdd.aac")
+        stamp = datetime(2026, 11, 6, 4, 30, tzinfo=timezone.utc).timestamp()
+        os.utime(path, (stamp, stamp))
+        result = self.listing(**{"from": "2026-11-05", "through": "2026-11-05"})
+        self.assertEqual(result["total"], 1)
+        row = result["files"][0]
+        self.assertEqual(row["date_source"], "modified")
+        self.assertEqual(row["display_name"], "upstairs_" + path.name)
+        self.assertIn("11-5-2026 11:30:00 PM EST", row["started_local"])
+
+    def test_same_timestamp_tie_and_active_extension_files(self):
+        a = self.put(name="20261108T120000.000000Z_aaaaaaaa.aac.part")
+        b = self.put(name="20261108T120000.000000Z_bbbbbbbb.aac")
+        text = self.put(kind="transcripts", name="20261108T120000.000000Z_aaaaaaaa.labeling.txt")
+        self.archive.active[a] = 1
+        result = self.listing()
+        self.assertEqual([r["name"] for r in result["files"]], [b.name, a.name])
+        self.assertTrue(result["files"][1]["active"])
+        self.assertIn("In progress", result["files"][1]["display_name"])
+        self.assertEqual(self.listing(kind="transcripts")["files"][0]["name"], text.name)
+
+    def test_unknown_dates_stay_reachable_unfiltered_and_counted_when_filtered(self):
+        self.put(name="without-a-date.aac", content=b"")
+        self.assertEqual(browser.timestamp("without-a-date.aac", SimpleNamespace(st_mtime=float("inf"))), (None, "unknown"))
+        with patch.object(browser, "timestamp", return_value=(None, "unknown")):
+            result = self.listing()
+            self.assertEqual((result["total"], result["undated_files"]), (1, 1))
+            self.assertEqual(result["files"][0]["date_source"], "unknown")
+            self.assertEqual(result["files"][0]["bytes"], 0)
+            self.assertIsNone(result["retained_oldest"])
+            filtered = self.listing(**{"from": "2026-01-01"})
+            self.assertEqual((filtered["total"], filtered["retained_total"], filtered["undated_files"]), (0, 1, 1))
+        with browser.open_file(self.archive, "audio", "upstairs", "without-a-date.aac") as (source, _):
+            self.assertEqual(source.read(), b"")
+
+    def test_no_writes_or_control_changes(self):
+        self.put()
+        state = DurableState(Path(self.temp.name) / "controls.json")
+        state.set("recording", False); state.set("transcription", False)
+        before = {str(p): (p.stat().st_size, p.stat().st_mtime_ns, p.read_bytes()) for p in Path(self.temp.name).rglob("*") if p.is_file()}
+        active, limits = dict(self.archive.active), dict(self.archive.limits)
+        for _ in range(3):
+            self.listing()
+        after = {str(p): (p.stat().st_size, p.stat().st_mtime_ns, p.read_bytes()) for p in Path(self.temp.name).rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+        self.assertEqual(active, dict(self.archive.active))
+        self.assertEqual(limits, self.archive.limits)
+        self.assertEqual(state.value, {"recording": False, "transcription": False})
+
+    def test_symlink_fifo_directory_hardlink_and_unrelated_extensions_refused(self):
+        folder = self.archive.root / "audio" / "upstairs"
+        outside = Path(self.temp.name) / "private.aac"; outside.write_bytes(b"outside")
+        (folder / "link.aac").symlink_to(outside)
+        os.link(outside, folder / "hard.aac")
+        (folder / "directory.aac").mkdir()
+        os.mkfifo(folder / "pipe.aac")
+        (folder / "settings.json").write_text("not audio")
+        self.assertEqual(self.listing()["total"], 0)
+        for name in ("link.aac", "hard.aac", "directory.aac", "pipe.aac", "settings.json",
+                     "../private.aac", "/etc/passwd", "..\\private.aac", "x\x00.aac"):
+            with self.subTest(name=name), self.assertRaises((ValueError, OSError)):
+                with browser.open_file(self.archive, "audio", "upstairs", name):
+                    self.fail("Unsafe file opened")
+
+    def test_directory_symlink_refused(self):
+        folder = self.archive.root / "audio" / "upstairs"
+        folder.rmdir()
+        folder.symlink_to(Path(self.temp.name))
+        with self.assertRaises((ValueError, OSError)):
+            self.listing()
+
+    def test_directory_swap_during_listing_pins_original(self):
+        self.put(name="inside.aac")
+        folder = self.archive.root / "audio" / "upstairs"
+        saved = folder.with_name("saved")
+        outside = Path(self.temp.name) / "outside"; outside.mkdir()
+        (outside / "private.aac").write_bytes(b"outside")
+        real_scan = browser.os.scandir
+        def raced(directory):
+            folder.rename(saved); folder.symlink_to(outside)
+            return real_scan(directory)
+        with patch.object(browser.os, "scandir", raced):
+            result = self.listing()
+        self.assertEqual([r["name"] for r in result["files"]], ["inside.aac"])
+
+    def test_swap_file_for_symlink_before_open_refused(self):
+        path = self.put()
+        outside = Path(self.temp.name) / "outside.aac"; outside.write_bytes(b"outside")
+        self.listing()
+        path.unlink(); path.symlink_to(outside)
+        with self.assertRaises((ValueError, OSError)):
+            with browser.open_file(self.archive, "audio", "upstairs", path.name):
+                self.fail("Symlink opened")
+
+    def test_directory_swap_during_download_uses_pinned_original(self):
+        path = self.put(content=b"inside")
+        folder = path.parent; saved = folder.with_name("saved")
+        outside = Path(self.temp.name) / "outside"; outside.mkdir()
+        (outside / path.name).write_bytes(b"outside")
+        original = browser.archive_directory
+        @contextmanager
+        def switched(*args):
+            with original(*args) as directory:
+                folder.rename(saved); folder.symlink_to(outside)
+                yield directory
+        with patch.object(browser, "archive_directory", switched):
+            with browser.open_file(self.archive, "audio", "upstairs", path.name) as (source, _):
+                self.assertEqual(source.read(), b"inside")
+
+    def test_retention_disappearance_during_scan_skips_without_failure(self):
+        path = self.put()
+        class Vanished:
+            name = path.name
+            def stat(self, **kwargs):
+                path.unlink()
+                raise FileNotFoundError()
+        @contextmanager
+        def raced(directory):
+            yield iter([Vanished()])
+        with patch.object(browser.os, "scandir", raced):
+            result = self.listing()
+        self.assertEqual((result["total"], result["skipped_unavailable"]), (0, 1))
+
+    def test_explicit_safety_limit_does_not_return_partial_totals(self):
+        for i in range(3):
+            self.put(name=f"{i}.aac")
+        with patch.object(browser, "MAX_FILES", 2), self.assertRaises(OverflowError):
+            self.listing()
+        with patch.object(browser, "MAX_SECONDS", -1), self.assertRaises(TimeoutError):
+            self.listing()
+
+    @contextmanager
+    def http(self, handler=Handler):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        # Component regression harness: authenticated boundary tested separately in test_app_auth.
+        server.app_auth = SimpleNamespace(context=lambda h: "/api/hassio_ingress/" + "x"*32, authenticated=lambda h, **kw: True)
+        server.daemon_threads = True
+        server.controller = SimpleNamespace(archive=self.archive)
+        server.transcript_api = TranscriptAPI(self.archive, {})
+        worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+        def request(path, method="GET", body=None, headers=None):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            try:
+                connection.request(method, path, body=body, headers=headers or {})
+                response = connection.getresponse()
+                return response.status, dict(response.getheaders()), response.read()
+            finally:
+                connection.close()
+        try:
+            yield request
+        finally:
+            server.shutdown(); server.server_close(); worker.join()
+
+    def test_http_api_legacy_new_validation_no_paths_or_contents(self):
+        self.put(content=b"private synthetic marker")
+        with self.http() as request:
+            status, headers, body = request("/api/files?page=1")
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Cache-Control"], "no-store")
+            self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+            self.assertEqual(json.loads(body)["total"], 1)
+            self.assertNotIn(self.temp.name.encode(), body)
+            self.assertNotIn(b"private synthetic marker", body)
+            self.assertIsInstance(json.loads(request("/api/files")[2]), list)
+            self.assertEqual(request("/api/files?page=0")[0], 400)
+
+    def test_http_download_original_audio_formatted_transcript_missing_and_traversal(self):
+        audio = self.put(content=b"audio fixture\x00\xff")
+        text = self.put(kind="transcripts", content=b"DJI Upstairs | capture start 2026-11-08T12:00:00.000+00:00\nSynthetic words.\n")
+        with self.http() as request:
+            status, headers, body = request("/download/audio/upstairs/" + quote(audio.name))
+            self.assertEqual((status, body), (200, audio.read_bytes()))
+            self.assertIn("11-8-2026", headers["Content-Disposition"])
+            status, headers, body = request("/download/transcripts/upstairs/" + quote(text.name))
+            self.assertEqual(status, 200)
+            self.assertIn(b"11-8-2026 7:00:00 AM EST", body)
+            self.assertIn(b"Synthetic words.", body)
+            audio.unlink()
+            status, headers, body = request("/download/audio/upstairs/" + audio.name)
+            self.assertEqual(status, 404)
+            self.assertIn(b"refresh", body)
+            for route in ("/download/audio/upstairs/..%2Fprivate.aac", "/download/audio/upstairs/%2Fetc%2Fpasswd",
+                          "/download/audio/elsewhere/file.aac", "/download/models/upstairs/settings.json"):
+                self.assertEqual(request(route)[0], 404)
+
+    def test_http_busy_listing_releases_after_error(self):
+        with self.http() as request:
+            with patch.object(Handler, "listing_lock", threading.BoundedSemaphore(0)):
+                self.assertEqual(request("/api/files?page=1")[0], 503)
+            self.put()
+            with patch.object(browser, "MAX_FILES", 0):
+                self.assertEqual(request("/api/files?page=1")[0], 503)
+            self.assertEqual(request("/api/files?page=1")[0], 200)
+
+    def test_ingress_auth_and_control_csrf_unchanged(self):
+        class Denied(Handler):
+            def permitted(self): return False
+        with self.http(Denied) as request:
+            for route in ("/api/files?page=1", "/download/audio/upstairs/file.aac", "/download-transcripts.zip"):
+                self.assertEqual(request(route)[0], 403)
+        with self.http() as request:
+            self.assertEqual(request("/api/control", "POST", b'{"control":"recording","enabled":true}',
+                                     {"Content-Type": "application/json"})[0], 403)
+            self.assertEqual(request(PREFIX + "inventory")[0], 403)
+            # A transcript bearer cannot grant access to browser/audio routes.
+        with self.http(Denied) as request:
+            self.assertEqual(request("/api/files?page=1", headers={"Authorization": "Bearer SYNTHETIC"})[0], 403)
+
+
+if __name__ == "__main__":
+    unittest.main()

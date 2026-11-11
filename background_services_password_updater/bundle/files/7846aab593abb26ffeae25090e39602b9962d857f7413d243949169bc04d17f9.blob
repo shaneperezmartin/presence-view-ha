@@ -1,0 +1,136 @@
+'use strict';
+// Synthetic DOM only: no browser, network, microphone, or real archive access.
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const vm=require('node:vm');
+const html=fs.readFileSync(__dirname+'/index.html','utf8');
+const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
+class Element {
+  constructor(){this.value='';this.textContent='';this.children=[];this.disabled=false;this.attributes={};this.validity={badInput:false};}
+  append(...nodes){this.children.push(...nodes);}
+  replaceChildren(...nodes){this.children=nodes;}
+  setAttribute(key,value){this.attributes[key]=value;}
+  removeAttribute(key){delete this.attributes[key];delete this[key];}
+  set innerHTML(_){throw Error('Unsafe HTML write');}
+}
+const flush=()=>new Promise(resolve=>setImmediate(resolve));
+function setup(){
+  const e=Object.fromEntries([...html.matchAll(/id="([^"]+)"/g)].map(m=>[m[1],new Element()]));
+  e.floor.value='upstairs';e.kind.value='audio';e.batchFloor.value='selected';e.batchDates.value='current';
+  const requests=[],fileRequests=[],unexpected=[];
+  const context=vm.createContext({document:{getElementById:id=>e[id],createElement:()=>new Element()},URLSearchParams,AbortController,Date,Number,Error,setInterval:()=>{},alert:()=>{},fetch:(url,options={})=>{
+    if(url.startsWith('api/batch-preview?'))return new Promise((resolve,reject)=>requests.push({url,options,resolve,reject}));
+    if(url.startsWith('api/files?')){fileRequests.push(url);return Promise.resolve({ok:true,json:async()=>({files:[{name:'keep.aac',bytes:1024}],page:2,pages:3,page_size:50,total:101,retained_total:101})});}
+    if(url==='api/status')return Promise.resolve({ok:true,json:async()=>({free_bytes:1e9})});
+    if(url==='api/diarization')return Promise.resolve({ok:true,json:async()=>({})});
+    unexpected.push(url);throw Error('Unexpected request '+url);
+  }});
+  vm.runInContext(script,context);
+  return {e,requests,fileRequests,unexpected,context};
+}
+function result(overrides={}){return {selection:{timezone:'America/New_York'},expected_files:151,estimated_bytes:3145728,active_files:0,unfinished_audio_files:0,unknown_date_files:0,excluded_unknown_date_files:0,unavailable_during_inventory:0,...overrides};}
+async function resolve(request,value=result()){request.resolve({ok:true,json:async()=>value});await flush();}
+function click(element,type='click',button=0){let prevented=false;element[type==='auxclick'?'onauxclick':'onclick']({type,button,preventDefault(){prevented=true;}});return prevented;}
+function enabled(h){return h.e.batchDownload.attributes['aria-disabled']==='false';}
+test('preview is explicit, accessible, all-page summary and native ZIP without fetching bytes',async()=>{
+  const h=setup();await flush();assert.equal(h.requests.length,0);
+  assert.equal(click(h.e.batchDownload),true);
+  const files=h.e.files.children,page=h.e.pageStatus.textContent;
+  h.e.batchPreview.onclick();assert.equal(h.requests[0].url,'api/batch-preview?kind=audio&floor=upstairs');
+  assert.equal(h.e.batchPreview.disabled,true);assert.equal(h.e.batchCancel.disabled,false);
+  await resolve(h.requests[0]);assert.match(h.e.batchSummary.textContent,/151 files.*3.0 MiB uncompressed \(3145728 bytes\).*All pages.*audio.*upstairs.*all retained dates/);
+  assert.equal(enabled(h),true);assert.equal(h.e.batchDownload.href,'download-batch.zip?kind=audio&floor=upstairs');
+  assert.match(html, /id="batchDownload"[^>]*target="_blank" rel="noopener"/);
+  assert.equal(click(h.e.batchDownload),false);assert.equal(enabled(h),false);assert.equal(click(h.e.batchDownload),true);
+  assert.equal(h.e.files.children,files);assert.equal(h.e.pageStatus.textContent,page);assert.equal(h.fileRequests.length,1);assert.deepEqual(h.unexpected,[]);
+  assert.match(h.e.batchStatus.textContent,/browser’s downloads panel.*one ZIP/);
+  assert.doesNotMatch(script,/history\.|location\s*=|window\.open|\.blob\(|createObjectURL/);
+  for(const id of ['batchFloor','batchDates'])assert.match(html,new RegExp('for="'+id+'"'));
+});
+test('current filter query exactly matches download query and inclusive dates',async()=>{
+  const h=setup();h.e.floor.value='downstairs';h.e.kind.value='transcripts';h.e.from.value='2026-11-01';h.e.through.value='2026-11-09';
+  h.e.batchPreview.onclick();await resolve(h.requests[0]);
+  const query='kind=transcripts&floor=downstairs&from=2026-11-01&through=2026-11-09';
+  assert.equal(h.requests[0].url,'api/batch-preview?'+query);assert.equal(h.e.batchDownload.href,'download-batch.zip?'+query);
+  assert.match(h.e.batchSummary.textContent,/transcripts.*downstairs.*2026-11-01 through 2026-11-09 \(inclusive\)/);
+});
+test('both floors and all dates override invalid current range; one-sided ranges work',async()=>{
+  const h=setup();h.e.batchFloor.value='both';h.e.batchDates.value='all';h.e.from.value='not a date';h.e.from.validity.badInput=true;
+  h.e.batchPreview.onclick();await resolve(h.requests[0]);
+  assert.equal(h.requests[0].url,'api/batch-preview?kind=audio&floor=both');assert.match(h.e.batchSummary.textContent,/both floors.*all retained dates/);
+  h.e.batchDates.value='current';h.e.from.validity.badInput=false;h.e.from.value='';h.e.through.value='2026-11-09';h.e.batchPreview.onclick();await resolve(h.requests[1]);
+  assert.match(h.requests[1].url,/&through=2026-11-09$/);assert.match(h.e.batchSummary.textContent,/earliest retained date through 2026-11-09/);
+});
+test('invalid, reversed and badInput dates never request preview',async()=>{
+  const h=setup();for(const value of ['2026-02-30','0000-01-01','x']){h.e.from.value=value;await h.e.batchPreview.onclick();assert.match(h.e.batchStatus.textContent,/valid dates/);}
+  h.e.from.value='2026-11-10';h.e.through.value='2026-11-01';await h.e.batchPreview.onclick();assert.match(h.e.batchStatus.textContent,/on or before/);
+  h.e.from.value='';h.e.through.value='';h.e.from.validity.badInput=true;await h.e.batchPreview.onclick();assert.match(h.e.batchStatus.textContent,/valid dates/);
+  assert.equal(h.requests.length,0);assert.equal(enabled(h),false);assert.equal(h.e.batchPreview.disabled,false);
+});
+test('repeated preview clicks do not duplicate requests; preview permits next download',async()=>{
+  const h=setup();h.e.batchPreview.onclick();h.e.batchPreview.onclick();assert.equal(h.requests.length,1);await resolve(h.requests[0]);
+  assert.equal(click(h.e.batchDownload,'auxclick',1),false);assert.equal(click(h.e.batchDownload,'auxclick',1),true);
+  h.e.batchPreview.onclick();assert.equal(enabled(h),false);await resolve(h.requests[1]);assert.equal(click(h.e.batchDownload),false);
+});
+test('every selection input invalidates preview and aborts its request',async()=>{
+  for(const id of ['floor','kind','from','through','batchFloor','batchDates']){
+    const h=setup();h.e.batchPreview.onclick();h.e[id].oninput();assert.equal(h.requests[0].options.signal.aborted,true);
+    await resolve(h.requests[0]);assert.equal(enabled(h),false);assert.equal(h.e.batchSummary.textContent,'');
+    h.e.batchPreview.onclick();await resolve(h.requests[1]);h.e[id].onchange();assert.equal(enabled(h),false);
+  }
+});
+test('stale success, stale rejection and slow JSON cannot overwrite newer preview',async()=>{
+  const h=setup();h.e.batchPreview.onclick();h.e.batchFloor.value='both';h.e.batchFloor.onchange();h.e.batchPreview.onclick();
+  await resolve(h.requests[1],result({expected_files:200}));const summary=h.e.batchSummary.textContent;
+  await resolve(h.requests[0],result({expected_files:1}));assert.equal(h.e.batchSummary.textContent,summary);
+  h.e.batchPreview.onclick();h.e.batchReset.onclick();h.requests[2].reject(Error('stale error'));await flush();assert.match(h.e.batchStatus.textContent,/reset/);
+  h.e.batchPreview.onclick();let finishJSON;h.requests[3].resolve({ok:true,json:()=>new Promise(resolve=>{finishJSON=resolve;})});await flush();h.e.batchCancel.onclick();finishJSON(result());await flush();assert.match(h.e.batchStatus.textContent,/canceled/);assert.equal(enabled(h),false);
+});
+test('empty, HTTP error, network error and malformed results recover',async()=>{
+  const h=setup();h.e.batchPreview.onclick();await resolve(h.requests[0],result({expected_files:0,estimated_bytes:0}));assert.equal(enabled(h),false);assert.match(h.e.batchStatus.textContent,/No matching files/);
+  for(const status of [400,500]){h.e.batchPreview.onclick();h.requests.at(-1).resolve({ok:false,status});await flush();assert.equal(enabled(h),false);assert.equal(h.e.batchPreview.disabled,false);}
+  h.e.batchPreview.onclick();h.requests.at(-1).reject(Error('Network unavailable'));await flush();assert.match(h.e.batchStatus.textContent,/Network unavailable/);
+  h.e.batchPreview.onclick();await resolve(h.requests.at(-1),result({expected_files:-1}));assert.match(h.e.batchStatus.textContent,/Invalid batch preview/);
+  h.e.batchPreview.onclick();await resolve(h.requests.at(-1));assert.equal(enabled(h),true);
+});
+test('cancel, reset, and clear dates discard readiness without changing file page themselves',async()=>{
+  const h=setup();await flush();const page=h.e.pageStatus.textContent;h.e.batchPreview.onclick();h.e.batchCancel.onclick();
+  assert.equal(h.requests[0].options.signal.aborted,true);assert.equal(h.e.batchPreview.disabled,false);assert.equal(h.e.batchCancel.disabled,true);assert.equal(h.e.pageStatus.textContent,page);
+  h.e.batchPreview.onclick();await resolve(h.requests[1]);h.e.batchReset.onclick();assert.equal(enabled(h),false);assert.equal(h.e.batchSummary.textContent,'');
+  h.e.batchPreview.onclick();await resolve(h.requests[2]);h.e.clearDates.onclick();assert.equal(enabled(h),false);
+});
+test('unknown, missing and active notices render as text, including hostile server strings',async()=>{
+  const h=setup();const hostile='<img src=x onerror=alert(1)>';
+  h.e.batchPreview.onclick();await resolve(h.requests[0],result({active_files:2,unfinished_audio_files:3,unknown_date_files:4,excluded_unknown_date_files:4,unavailable_during_inventory:hostile,selection:{timezone:hostile}}));
+  assert.match(h.e.batchNotices.textContent,/2 files are still being written/);assert.match(h.e.batchNotices.textContent,/3 unfinished audio/);assert.match(h.e.batchNotices.textContent,/4 retained files have unknown dates/);assert.match(h.e.batchNotices.textContent,/4 unknown-date files excluded/);
+  assert.ok(h.e.batchNotices.textContent.includes(hostile));assert.ok(h.e.batchSummary.textContent.includes(hostile));assert.deepEqual(h.e.batchNotices.children,[]);assert.doesNotMatch(script,/innerHTML/);
+});
+test('silent selection change during pending preview is rejected',async()=>{
+  const h=setup();h.e.batchPreview.onclick();h.e.kind.value='transcripts';await resolve(h.requests[0]);assert.equal(enabled(h),false);assert.match(h.e.batchStatus.textContent,/Selection changed/);
+});
+
+test('silent selection change after preview blocks click and middle-click, including invalid dates',async()=>{
+  for(const [type,button] of [['click',0],['auxclick',1]]){
+    const h=setup();h.e.batchPreview.onclick();await resolve(h.requests[0]);
+    h.e.kind.value='transcripts';assert.equal(click(h.e.batchDownload,type,button),true);
+    assert.equal(enabled(h),false);assert.equal(h.e.batchDownload.href,undefined);assert.equal(h.e.batchDownload.tabIndex,-1);
+    assert.match(h.e.batchStatus.textContent,/Selection changed/);
+    h.e.batchPreview.onclick();await resolve(h.requests[1]);h.e.from.value='2026-02-30';
+    assert.equal(click(h.e.batchDownload,type,button),true);assert.equal(enabled(h),false);assert.equal(h.e.batchDownload.href,undefined);
+    assert.match(h.e.batchStatus.textContent,/valid dates/);
+  }
+});
+test('reset and cancel remove native href and disabled keyboard-style click cannot navigate',async()=>{
+  const h=setup();h.e.batchPreview.onclick();await resolve(h.requests[0]);h.e.batchReset.onclick();
+  assert.equal(h.e.batchDownload.href,undefined);assert.equal(h.e.batchDownload.tabIndex,-1);assert.equal(click(h.e.batchDownload),true);
+  h.e.batchPreview.onclick();await resolve(h.requests[1]);h.e.batchCancel.onclick();assert.equal(h.e.batchDownload.href,undefined);
+});
+
+test('download notice discloses deadlines, stalled connections and interruption recovery',()=>{
+  assert.match(html,/Audio ZIPs can run for up to 12 hours; transcript ZIPs for 30 minutes/);
+  assert.match(html,/A stalled connection times out after 15 seconds/);
+  assert.match(html,/A missing manifest\.json or broken ZIP means interruption; retry/);
+  assert.match(html,/The server allows one ZIP download at a time/);
+  assert.match(script,/estimated .*uncompressed/);
+});

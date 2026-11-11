@@ -1,0 +1,7 @@
+paho-mqtt==2.1.0
+webrtcvad-wheels==2.0.14.post1
+huggingface-hub==2.4.0
+pyannote.audio==4.0.7
+torch==2.9.1+cpu
+torchaudio==2.9.1+cpu
+torchcodec==0.8.1

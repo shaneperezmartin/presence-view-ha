@@ -1,0 +1,18 @@
+"""Private local verifier generator: no network or password storage."""
+import getpass
+import json
+import sys
+from app_auth import password_record
+
+
+def generate():
+    if not sys.stdin.isatty(): raise RuntimeError('An interactive private terminal is required')
+    password = getpass.getpass('New Background Services password (12–256 characters): ')
+    if password != getpass.getpass('Confirm password: '): raise ValueError('Passwords did not match')
+    record = password_record(password)
+    print('Paste ONLY the following verifier into the private app_password_verifier option in Home Assistant over HTTPS:')
+    print(json.dumps(record, separators=(',', ':')))
+    print('Save and restart only this app. Keep this verifier private; never put it in chat or a public repository.')
+
+
+if __name__ == '__main__': generate()

@@ -1,0 +1,198 @@
+"""Read-only HA-ingress archive browsing. Never enumerate unrelated directories."""
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+import os
+import re
+import stat
+import time
+from urllib.parse import parse_qs
+
+from archive import FLOORS
+from presentation import LOCAL, NAME, friendly_name, instant
+
+MAX_FILES = 50000  # Fail explicitly, never pretend a truncated catalogue is complete.
+MAX_SECONDS = 10
+MAX_PAGE_SIZE = 100
+
+
+@dataclass(frozen=True)
+class Selection:
+    kind: str = "audio"
+    floor: str = "upstairs"
+    page: int = 1
+    page_size: int = 50
+    start: date | None = None
+    through: date | None = None
+    legacy: bool = False
+
+
+def selection(query):
+    if len(query) > 2048:
+        raise ValueError("Invalid file filters")
+    values = parse_qs(query, keep_blank_values=True, strict_parsing=True,
+                      max_num_fields=6, encoding="utf-8", errors="strict")
+    allowed = {"kind", "floor", "page", "page_size", "from", "through"}
+    if set(values) - allowed or any(len(v) != 1 for v in values.values()):
+        raise ValueError("Invalid file filters")
+    args = {k: v[0] for k, v in values.items()}
+    kind, floor = args.get("kind", "audio"), args.get("floor", "upstairs")
+    if kind not in ("audio", "transcripts") or floor not in FLOORS:
+        raise ValueError("Invalid file filters")
+    def number(key, default, maximum):
+        value = args.get(key, str(default))
+        if not re.fullmatch(r"[1-9][0-9]{0,8}", value) or int(value) > maximum:
+            raise ValueError("Invalid pagination")
+        return int(value)
+    def day(key):
+        value = args.get(key, "")
+        if not value:
+            return None
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+            raise ValueError("Invalid date")
+        return date.fromisoformat(value)
+    start, through = day("from"), day("through")
+    if start and through and start > through:
+        raise ValueError("Date range reversed")
+    legacy = not ({"page", "page_size", "from", "through"} & values.keys())
+    return Selection(kind, floor, number("page", 1, 999999999),
+                     number("page_size", 100 if legacy else 50, MAX_PAGE_SIZE),
+                     start, through, legacy)
+
+
+def valid_name(kind, name):
+    return (isinstance(name, str) and bool(name) and name not in (".", "..")
+            and not any(c in name for c in ("/", "\\", "\x00"))
+            and ((kind == "audio" and name.endswith((".aac", ".aac.part")))
+                 or (kind == "transcripts" and name.endswith(".txt"))))
+
+
+@contextmanager
+def archive_directory(archive, kind, floor):
+    if kind not in ("audio", "transcripts") or floor not in FLOORS:
+        raise ValueError("Invalid archive selection")
+    descriptors = []
+    try:
+        if os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW"):
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            directory = os.open(archive.root, flags)
+            descriptors.append(directory)
+            for component in (kind, floor):
+                directory = os.open(component, flags, dir_fd=directory)
+                descriptors.append(directory)
+            yield directory
+        else:
+            # Portable synthetic-test fallback; production uses Linux dirfds.
+            folder = archive.root / kind / floor
+            if any(p.is_symlink() for p in (archive.root, folder.parent, folder)) or not folder.resolve().is_relative_to(archive.root):
+                raise ValueError("Invalid archive directory")
+            yield folder
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+@contextmanager
+def open_file(archive, kind, floor, name):
+    if not valid_name(kind, name):
+        raise ValueError("Invalid archive file")
+    with archive_directory(archive, kind, floor) as directory:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = (os.open(name, flags | os.O_NOFOLLOW, dir_fd=directory)
+              if isinstance(directory, int) else os.open(archive.safe(kind, floor, name), flags))
+        try:
+            source = os.fdopen(fd, "rb")
+        except Exception:
+            os.close(fd)
+            raise
+        with source:
+            snapshot = os.fstat(source.fileno())
+            if not stat.S_ISREG(snapshot.st_mode) or snapshot.st_nlink != 1:
+                raise ValueError("Not a private regular file")
+            yield source, snapshot
+
+
+def label(name, floor, kind):
+    try:
+        return friendly_name(name, floor, kind)
+    except (ValueError, OverflowError):
+        return re.sub(r"[^a-zA-Z0-9._ -]", "_", f"{floor}_{name}")
+
+
+def timestamp(name, snapshot):
+    match = NAME.fullmatch(name)
+    if match:
+        try:
+            value = datetime.strptime(match[1], "%Y%m%dT%H%M%S.%fZ").replace(tzinfo=timezone.utc)
+            value.astimezone(LOCAL)  # Check that New York conversion is representable.
+            return value, "filename"
+        except (ValueError, OverflowError):
+            pass
+    try:
+        value = datetime.fromtimestamp(snapshot.st_mtime, timezone.utc)
+        value.astimezone(LOCAL)
+        return value, "modified"
+    except (ValueError, OverflowError, OSError):
+        return None, "unknown"
+
+
+def scope(values):
+    known = [value for value in values if value is not None]
+    def shown(value):
+        return {"utc": value.isoformat(), "local": instant(value)}
+    return ((shown(min(known)), shown(max(known))) if known else (None, None))
+
+
+def list_files(archive, request):
+    """Fresh bounded catalogue, outside the controller event loop. No file contents."""
+    deadline = time.monotonic() + MAX_SECONDS
+    rows, retained_dates, skipped, undated = [], [], 0, 0
+    with archive_directory(archive, request.kind, request.floor) as directory, os.scandir(directory) as entries:
+        for entry in entries:
+            if time.monotonic() > deadline:
+                raise TimeoutError("File listing timed out")
+            if not valid_name(request.kind, entry.name):
+                continue
+            try:
+                snapshot = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                skipped += 1
+                continue  # Retention may remove an entry while we enumerate.
+            if not stat.S_ISREG(snapshot.st_mode) or snapshot.st_nlink != 1:
+                continue
+            if len(retained_dates) >= MAX_FILES:
+                raise OverflowError("Archive is too large to list safely")
+            started, source = timestamp(entry.name, snapshot)
+            retained_dates.append(started)
+            if started is None:
+                undated += 1
+            local_day = started.astimezone(LOCAL).date() if started else None
+            if request.start and (local_day is None or local_day < request.start):
+                continue
+            if request.through and (local_day is None or local_day > request.through):
+                continue
+            # Counter.get does not create entries or modify retention state.
+            active = archive.active.get(archive.root / request.kind / request.floor / entry.name, 0) > 0
+            rows.append((started, entry.name, snapshot.st_size, active, source))
+    rows.sort(key=(lambda row: row[1]) if request.legacy else
+              (lambda row: (row[0] or datetime.min.replace(tzinfo=timezone.utc), row[1])), reverse=True)
+    total = len(rows)
+    pages = (total + request.page_size - 1) // request.page_size
+    page = min(request.page, max(pages, 1))
+    output = []
+    for started, name, size, active, source in rows[(page - 1) * request.page_size:page * request.page_size]:
+        row = {"name": name, "display_name": label(name, request.floor, request.kind),
+               "bytes": size, "active": active}
+        if not request.legacy:
+            row.update(started_utc=started.isoformat() if started else None,
+                       started_local=instant(started) if started else None, date_source=source)
+        output.append(row)
+    if request.legacy:
+        return output
+    oldest, newest = scope(row[0] for row in rows)
+    retained_oldest, retained_newest = scope(retained_dates)
+    return {"files": output, "page": page, "page_size": request.page_size,
+            "total": total, "pages": pages, "retained_total": len(retained_dates),
+            "oldest": oldest, "newest": newest, "retained_oldest": retained_oldest,
+            "retained_newest": retained_newest, "timezone": "America/New_York",
+            "skipped_unavailable": skipped, "undated_files": undated}

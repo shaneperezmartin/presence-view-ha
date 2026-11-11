@@ -1,0 +1,24 @@
+'use strict';
+// Synthetic DOM tests only; real HA ingress/browser verification remains required.
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+for(const file of ['index.html','model-setup.html']) {
+  function setup(status=200) {
+    const button={},events={},requests=[],navigations=[],alerts=[];let cleared=0;
+    const context={document:{querySelector:()=>button,body:{replaceChildren(){cleared++;}}},location:{replace:u=>navigations.push(u),reload:()=>navigations.push('reload')},alert:m=>alerts.push(m)};
+    context.window=context;context.addEventListener=(e,f)=>events[e]=f;
+    context.fetch=async(...args)=>{requests.push(args);return {status,ok:status>=200&&status<300};};
+    vm.createContext(context);
+    const scripts=[...fs.readFileSync(__dirname+'/'+file,'utf8').matchAll(/<script>([\s\S]*?)<\/script>/g)];
+    vm.runInContext(scripts[scripts.length-1][1],context);
+    return {context,button,events,requests,navigations,alerts,cleared:()=>cleared};
+  }
+  test(file+': confirmed lock uses POST and replaces history',async()=>{
+    const h=setup();await h.button.onclick();assert.equal(h.requests[0][0],'auth/logout');assert.equal(h.requests[0][1].method,'POST');assert.equal(h.requests[0][1].headers['X-Archive-Control'],'1');assert.deepEqual(h.navigations,['login']);
+  });
+  test(file+': failed lock reports uncertainty',async()=>{
+    const h=setup(503);await h.button.onclick();assert.equal(h.alerts.length,1);assert.deepEqual(h.navigations,[]);
+  });
+  test(file+': expiry removes rendered content; back cache reloads',async()=>{
+    const h=setup(401);await h.context.fetch('api/status');assert.equal(h.cleared(),1);assert.deepEqual(h.navigations,['login']);h.events.pageshow({persisted:true});assert.deepEqual(h.navigations,['login','reload']);
+  });
+}

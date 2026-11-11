@@ -1,0 +1,30 @@
+"""Isolated authenticated download; no credential persistence or exception logging."""
+import logging
+import os
+from pathlib import Path
+import signal
+import sys
+from model_setup import download, valid_token, write_state
+
+def main():
+    os.umask(0o077)
+    logging.disable(logging.CRITICAL)
+    root = Path(sys.argv[1])
+    token = sys.stdin.readline(512).strip()
+    if not valid_token(token):
+        write_state(root, "failed", error="access")
+        return 1
+    # Bound credential lifetime even if a remote transfer stalls.
+    if hasattr(signal, "alarm"): signal.alarm(600)
+    try:
+        from huggingface_hub import hf_hub_download
+        ok = download(root, token, hf_hub_download, int(sys.argv[2]) * 10**9)
+        return 0 if ok else 1
+    except Exception:
+        write_state(root, "failed", error="network")
+        return 1
+    finally:
+        token = None
+
+if __name__ == "__main__": sys.exit(main())
+

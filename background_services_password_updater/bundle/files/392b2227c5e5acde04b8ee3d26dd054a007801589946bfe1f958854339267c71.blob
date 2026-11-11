@@ -1,0 +1,196 @@
+"""Bounded local speaker labeling. Audio stays in process memory and pipes."""
+from __future__ import annotations
+import asyncio
+from datetime import datetime
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+MAX_PCM = 16000 * 2 * 600
+LINE = re.compile(r'^\[([^\]]+) - ([^\]]+)\] (.*)$')
+
+
+def private_environment():
+    env = {k: v for k, v in os.environ.items() if k not in
+           {'HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN', 'SUPERVISOR_TOKEN', 'HASSIO_TOKEN'}}
+    env.update(HF_HUB_OFFLINE='1', HF_HUB_DISABLE_IMPLICIT_TOKEN='1',
+               HF_HUB_DISABLE_TELEMETRY='1', HF_TOKEN_PATH=os.devnull,
+               PYANNOTE_METRICS_ENABLED='0', OTEL_SDK_DISABLED='true', DO_NOT_TRACK='1',
+               OMP_NUM_THREADS='2', MKL_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1',
+               NUMBA_NUM_THREADS='2', MPLCONFIGDIR='/tmp/dji-matplotlib')
+    return env
+
+
+def checked_turns(value, duration):
+    if not isinstance(value, list) or len(value) > 6000: raise ValueError('Invalid result')
+    turns = []
+    for item in value:
+        if not isinstance(item, list) or len(item) != 3: raise ValueError('Invalid turn')
+        start, end, speaker = item
+        if (type(start) not in (float, int) or type(end) not in (float, int)
+            or not math.isfinite(start) or not math.isfinite(end)
+            or not 0 <= start < end <= duration + .1
+            or type(speaker) is not int or not 1 <= speaker <= 100):
+            raise ValueError('Invalid turn')
+        turns.append((float(start), float(end), speaker))
+    return sorted(turns)
+
+
+def labeled_text(original, turns, epoch):
+    """Annotate existing passage intervals; never invent word-level attribution."""
+    output = []
+    for line in original.splitlines():
+        match = LINE.match(line)
+        if match and not match[3].startswith('['):
+            try:
+                start = datetime.fromisoformat(match[1]).timestamp() - epoch
+                end = datetime.fromisoformat(match[2]).timestamp() - epoch
+                weights = {}
+                for a, b, speaker in turns:
+                    overlap = max(0., min(end, b) - max(start, a))
+                    if overlap: weights[speaker] = weights.get(speaker, 0) + overlap
+                total = sum(weights.values())
+                chosen = sorted(s for s, amount in weights.items() if amount >= max(.1, total * .1))
+                if len(chosen) == 1: label = f'Speaker {chosen[0]}'
+                elif chosen: label = 'Mixed speakers ' + ', '.join(map(str, chosen))
+                else: label = 'Speaker uncertain'
+                line = f'[{match[1]} - {match[2]}] {label}: {match[3]}'
+            except (ValueError, OverflowError): pass
+        output.append(line)
+    output.append('\nSpeaker labeling complete. Anonymous labels apply only within this floor/file.')
+    output.append('Mixed passages are not word-aligned; labels may be inaccurate. No identity matching.')
+    output.append('Speaker timeline (seconds from capture start):')
+    output.extend(f'{a:.2f}-{b:.2f}: Speaker {s}' for a, b, s in turns)
+    if not turns: output.append('No speaker turns detected.')
+    return '\n'.join(output) + '\n'
+
+
+async def infer(pcm, model, timeout=240):
+    if not 0 < len(pcm) <= MAX_PCM or len(pcm) % 2: raise ValueError('Invalid audio length')
+    proc = await asyncio.create_subprocess_exec(sys.executable,
+        str(Path(__file__).with_name('diarization_worker.py')), str(model),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL, env=private_environment())
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(pcm), timeout)
+        if len(stdout) > 1_000_000: raise RuntimeError('Invalid worker response')
+        result = json.loads(stdout)
+        if proc.returncode or result.get('success') is not True:
+            stage = result.get('stage')
+            raise RuntimeError(stage if stage in ('integrity', 'load', 'inference', 'memory') else 'worker')
+        result['turns'] = checked_turns(result['turns'], len(pcm) / 32000)
+        return result
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
+class Diarizer:
+    def __init__(self, controller):
+        self.c = controller
+        self.model = controller.data / 'models' / 'community-1'
+        self.queue = asyncio.Queue(maxsize=2)
+        self.buffers = [bytearray(), bytearray()]
+        self.starts = [None, None]
+        self.busy = False
+        self.completed = self.failed = 0
+        self.last_metrics = None
+        self.error = None
+        self.test_result = None
+        self.test_task = None
+
+    def ready(self):
+        return (self.model / 'config.yaml').is_file()
+
+    def status(self):
+        return {'model_present': self.ready(), 'processing': self.busy,
+                'pending_files': self.queue.qsize(), 'completed_files': self.completed,
+                'failed_files': self.failed, 'error': self.error,
+                'last_metrics': self.last_metrics, 'synthetic_test': self.test_result,
+                'labels': 'Anonymous; reset per floor and ten-minute file',
+                'audio_buffer_bytes': sum(map(len, self.buffers))}
+
+    def feed(self, channels, epoch):
+        if not self.ready(): return
+        for i, channel in enumerate(channels):
+            if self.starts[i] is None: self.starts[i] = epoch
+            if len(self.buffers[i]) + len(channel) > MAX_PCM: raise ValueError('Segment buffer limit')
+            self.buffers[i].extend(channel)
+
+    def finish(self, i, path):
+        pcm, start = self.buffers[i], self.starts[i]
+        self.buffers[i], self.starts[i] = bytearray(), None
+        if path is None or not pcm: return
+        if self.queue.full():
+            self.failed += 1
+            self.error = 'Speaker labeling is behind; a file will keep plain transcript text'
+            self.c.archive.append(path, '\n[Speaker labels unavailable: processing queue full]\n')
+            return
+        self.c.archive.active[path] += 1
+        self.queue.put_nowait((path, pcm, start))
+
+    async def process(self, path, pcm, start):
+        # Keep the file active until its original Whisper writes are finished.
+        async with asyncio.timeout(240):
+            while self.c.archive.active[path] > 1: await asyncio.sleep(.2)
+        original = path.read_text(encoding='utf-8')
+        has_text = any(LINE.match(line) and not LINE.match(line)[3].startswith('[')
+                       for line in original.splitlines())
+        result = await infer(pcm, self.model) if has_text else {'turns': [], 'seconds': 0, 'peak_rss_mb': 0}
+        updated = labeled_text(original, result['turns'], start)
+        # Keep interrupted replacement files inside normal 30-day text retention.
+        tmp = path.with_name(path.stem + '.labeling.txt')
+        with tmp.open('w', encoding='utf-8') as handle:
+            handle.write(updated); handle.flush(); os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        self.last_metrics = {k: result[k] for k in ('seconds', 'peak_rss_mb')}
+        self.completed += 1
+        self.error = None
+
+    async def loop(self):
+        while True:
+            path, pcm, start = await self.queue.get()
+            self.busy = True
+            self.c.on_change()
+            try:
+                await self.process(path, pcm, start)
+            except asyncio.CancelledError:
+                self.c.archive.append(path, '\n[Speaker labels unavailable: app stopped during processing]\n')
+                raise
+            except Exception:
+                self.failed += 1
+                self.error = 'Speaker labeling failed for a file; its plain transcript is preserved'
+                self.c.archive.append(path, '\n[Speaker labels unavailable: local processing failed]\n')
+            finally:
+                pcm = None
+                self.c.archive.active[path] -= 1
+                self.queue.task_done()
+                self.busy = False
+                self.c.on_change()
+
+    async def synthetic(self):
+        self.test_result = {'phase': 'running', 'microphone_opened': False}
+        try:
+            # One minute of digital silence exercises local loading and inference only.
+            result = await infer(bytes(60 * 32000), self.model)
+            self.test_result = {'phase': 'passed', 'microphone_opened': False,
+                'synthetic_seconds': 60, 'inference_seconds': result['seconds'],
+                'peak_rss_mb': result['peak_rss_mb'], 'detected_turns': len(result['turns']),
+                'offline': True, 'real_speaker_accuracy_verified': False}
+        except Exception as exc:
+            stage = str(exc)
+            self.test_result = {'phase': 'failed', 'microphone_opened': False,
+                'stage': stage if stage in ('integrity', 'load', 'inference', 'memory', 'worker') else 'timeout_or_worker'}
+
+    def start_test(self):
+        if self.busy or not self.queue.empty() or any(self.c.state.value.values()) or self.c.proc is not None:
+            raise RuntimeError('Capture and processing must be idle')
+        if self.test_task and not self.test_task.done(): raise RuntimeError('Test running')
+        self.test_result = {'phase': 'running', 'microphone_opened': False}
+        self.test_task = asyncio.create_task(self.synthetic())
+        return self.test_result
