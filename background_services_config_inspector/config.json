@@ -1,6 +1,6 @@
 {
   "name": "Background Services Config Inspector",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "slug": "background_services_config_inspector",
   "description": "Read-only comparison that reports fixed field names and booleans, never private values or hashes",
   "arch": [

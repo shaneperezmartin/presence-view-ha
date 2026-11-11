@@ -232,6 +232,75 @@ class FileTests(unittest.TestCase):
         with self.assertRaisesRegex(d.Refused,'mode'):self.run_inspect()
         self.assertEqual(stat.S_IMODE(p.stat().st_mode),0o666)
 
+    def test_discovery_accepts_only_six_explicit_modes(self):
+        self.assertEqual(d.DISCOVERY_MODES,frozenset((0o400,0o440,0o444,0o600,0o640,0o644)))
+
+    def test_unrelated_safe_modes_are_readonly_and_do_not_change_output(self):
+        p=self.other/'config.json'
+        p.write_text('{"slug":"PRIVATE_UNRELATED_SLUG","PRIVATE_UNRELATED_KEY":"PRIVATE_UNRELATED_VALUE"}')
+        expected=self.run_inspect()
+        for mode in sorted(d.DISCOVERY_MODES):
+            with self.subTest(mode=oct(mode)):
+                p.chmod(mode);before=self.snapshot();result=self.run_inspect()
+                self.assertEqual(result,expected);self.assertEqual(before,self.snapshot())
+                self.assertNotIn('PRIVATE_UNRELATED',json.dumps(result))
+
+    def test_target_restrictive_or_world_readable_non644_mode_still_refuses(self):
+        p=self.app/'config.json'
+        for mode in sorted(d.DISCOVERY_MODES-{0o644}):
+            with self.subTest(mode=oct(mode)):
+                p.chmod(mode);before=self.snapshot()
+                with self.assertRaisesRegex(d.Refused,'Target config mode'):self.run_inspect()
+                self.assertEqual(before,self.snapshot())
+
+    def test_unsafe_discovery_modes_refuse_before_reading_bytes(self):
+        p=self.other/'config.json'
+        unsafe=(0o000,0o200,0o004,0o040,0o404,0o604,0o620,0o660,0o664,0o666,0o700,0o755,0o1644,0o2644,0o4644)
+        real_read=d.os.read
+        identity=(p.stat().st_dev,p.stat().st_ino)
+        def no_unsafe_read(fd,*args):
+            st=os.fstat(fd)
+            self.assertNotEqual((st.st_dev,st.st_ino),identity)
+            return real_read(fd,*args)
+        for mode in unsafe:
+            with self.subTest(mode=oct(mode)):
+                p.chmod(mode)
+                with mock.patch.object(d.os,'read',no_unsafe_read):
+                    with self.assertRaises((d.Refused,PermissionError)) as caught:self.run_inspect()
+                    if isinstance(caught.exception,d.Refused):
+                        self.assertEqual(str(caught.exception),'Discovery config mode is not safe for bounded read')
+                self.assertEqual(stat.S_IMODE(p.stat().st_mode),mode)
+
+    def test_non644_duplicate_target_cannot_be_skipped_as_unrelated(self):
+        p=self.other/'config.json';p.write_bytes(BASE);p.chmod(0o600)
+        with self.assertRaisesRegex(d.Refused,'Target config mode'):self.run_inspect()
+
+    def test_target_exact_mode_checked_on_all_nondiscovery_reads(self):
+        real=d.read_config;seen=[]
+        def recording(fd,name='config.json',**kwargs):
+            seen.append((name,kwargs.get('discovery',False)))
+            return real(fd,name,**kwargs)
+        with mock.patch.object(d,'read_config',recording):self.run_inspect()
+        self.assertEqual(seen.count(('config.json',False)),2)
+        self.assertEqual(seen.count(('config.json',True)),4)
+        self.assertIn(('public-baseline.blob',False),seen)
+
+    def test_target_mode_race_after_discovery_refuses(self):
+        real=d.discover;calls=0
+        def race(*args):
+            nonlocal calls
+            result=real(*args);calls+=1
+            if calls==1:(self.app/'config.json').chmod(0o600)
+            return result
+        with mock.patch.object(d,'discover',race):
+            with self.assertRaisesRegex(d.Refused,'Config mode'):self.run_inspect()
+
+    def test_public_template_mode_remains_exact(self):
+        for mode in sorted(d.DISCOVERY_MODES-{0o644}):
+            with self.subTest(mode=oct(mode)):
+                self.template.chmod(mode)
+                with self.assertRaisesRegex(d.Refused,'Config mode'):self.run_inspect()
+
     def test_large_source_rejected(self):
         (self.app/'config.json').write_bytes(b' '*(d.MAX_CONFIG_BYTES+1))
         with self.assertRaisesRegex(d.Refused,'size'):self.run_inspect()
@@ -246,9 +315,9 @@ class FileTests(unittest.TestCase):
 
     def test_source_change_after_discovery_rejected(self):
         real=d.read_config;count=0
-        def race(fd,name='config.json'):
+        def race(fd,name='config.json',**kwargs):
             nonlocal count
-            result=real(fd,name)
+            result=real(fd,name,**kwargs)
             if name=='config.json' and result and PRIVATE.encode() in result[0]:
                 count+=1
                 if count==1:(self.app/'config.json').write_bytes(BASE)

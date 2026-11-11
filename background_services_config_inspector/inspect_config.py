@@ -27,6 +27,8 @@ MAX_SECONDS = 5.0
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
 FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 DIRFLAGS = FLAGS | os.O_DIRECTORY
+# Discovery may read restrictive ordinary configs, never execute/special/writable-by-others modes.
+DISCOVERY_MODES = frozenset((0o400, 0o440, 0o444, 0o600, 0o640, 0o644))
 
 
 class Refused(Exception):
@@ -62,13 +64,17 @@ def directory(path, parent=None):
     finally:os.close(fd)
 
 
-def read_config(parent, name='config.json'):
+def read_config(parent, name='config.json', *, discovery=False):
     try:fd=os.open(name,FLAGS,dir_fd=parent)
     except FileNotFoundError:return None
     try:
         before=os.fstat(fd)
         require(stat.S_ISREG(before.st_mode) and before.st_nlink==1,'Config must be a regular single-link file')
-        require(stat.S_IMODE(before.st_mode)==0o644,'Config mode differs from reviewed mode')
+        mode=stat.S_IMODE(before.st_mode)
+        if discovery:
+            require(mode in DISCOVERY_MODES,'Discovery config mode is not safe for bounded read')
+        else:
+            require(mode==0o644,'Config mode differs from reviewed mode')
         require(0<=before.st_size<=MAX_CONFIG_BYTES,'Config exceeds bounded size')
         result=bytearray()
         while True:
@@ -157,10 +163,11 @@ def discover(root, deadline):
         with directory(child,root) as fd:
             require((st.st_dev,st.st_ino)==(os.fstat(fd).st_dev,os.fstat(fd).st_ino),'Directory replaced during discovery')
             check_config_layout(fd)
-            item=read_config(fd)
+            item=read_config(fd,discovery=True)
             if item is None:continue
             cfg=parse_config(item[0])
             if cfg.get('slug')==SLUG:
+                require(stat.S_IMODE(item[1][2])==0o644,'Target config mode differs from reviewed mode')
                 require(type(cfg.get('version')) is str and cfg['version']==VERSION,'Target source version is not reviewed baseline')
                 matches.append((child,st.st_dev,st.st_ino,item[1]))
     require(len(matches)==1,'Target absent or ambiguous')
