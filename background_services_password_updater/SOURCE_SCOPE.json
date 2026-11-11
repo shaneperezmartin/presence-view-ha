@@ -309,5 +309,5 @@
     "test_transcript_export.py",
     "config.json"
   ],
-  "preservation": "Saved Supervisor options/data/MQTT are not mounted; inert extra files require metadata-only allowlist; unknown/private source config variants refuse"
+  "preservation": "Saved Supervisor options/data/MQTT are not mounted; inert extras require metadata-only allowlist; only exact independently pinned historical two-field config transformation may preserve existing source defaults privately"
 }

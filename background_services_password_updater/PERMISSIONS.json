@@ -1,6 +1,6 @@
 {
   "helper_slug": "background_services_password_updater",
-  "helper_version": "0.1.0",
+  "helper_version": "0.1.1",
   "target_config_slug": "dji_audio_archive",
   "target_installed_slug": "local_dji_audio_archive",
   "permission_requiring_action_time_confirmation": {
@@ -42,6 +42,8 @@
     "rollback_security_loss_confirmed": false,
     "preserve_extra_files": [],
     "diagnostic_offset": 0,
-    "diagnostic_snapshot": ""
-  }
+    "diagnostic_snapshot": "",
+    "private_baseline_config_sha256": ""
+  },
+  "private_pin_scope": "Independently recorded historical config hash, entered privately; authenticates only the reviewed two-field transform, never arbitrary source"
 }

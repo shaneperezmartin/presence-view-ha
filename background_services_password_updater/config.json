@@ -1,6 +1,6 @@
 {
   "name": "Background Services Password Source Updater",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "slug": "background_services_password_updater",
   "description": "Manual offline source-only helper for the reviewed 0.2.6 to 0.2.7 password candidate",
   "arch": [
@@ -26,7 +26,8 @@
     "rollback_security_loss_confirmed": false,
     "preserve_extra_files": [],
     "diagnostic_offset": 0,
-    "diagnostic_snapshot": ""
+    "diagnostic_snapshot": "",
+    "private_baseline_config_sha256": ""
   },
   "schema": {
     "mode": "list(inspect|diagnose|apply|rollback)",
@@ -37,6 +38,7 @@
       "str"
     ],
     "diagnostic_offset": "int(0,255)",
-    "diagnostic_snapshot": "str"
+    "diagnostic_snapshot": "str",
+    "private_baseline_config_sha256": "password"
   }
 }

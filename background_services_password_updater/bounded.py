@@ -5,17 +5,18 @@ import sys
 
 from updater import Updater, Refused, SourceMismatch, require, parse_config
 from release_pin import BUNDLE_SHA256
+from compatibility import preserve_historical_defaults
 
 ROOT = '/local_apps'
 BUNDLE = '/app/bundle'
 OPTIONS = '/data/options.json'
 OPTION_NAMES = {'mode', 'expected_fingerprint', 'maintenance_confirmed',
                 'rollback_security_loss_confirmed', 'preserve_extra_files',
-                'diagnostic_offset', 'diagnostic_snapshot'}
+                'diagnostic_offset', 'diagnostic_snapshot', 'private_baseline_config_sha256'}
 
 
 class BoundedUpdater(Updater):
-    def __init__(self, root, bundle, preserve_extra_files=None):
+    def __init__(self, root, bundle, preserve_extra_files=None, private_baseline_config_sha256=""):
         super().__init__(root, bundle, preserve_extra_files=preserve_extra_files)
         require(self.manifest['schema'] == 2 and self.config == 'config.json' and
                 self.manifest['baseline']['version'] == '0.2.6' and
@@ -31,6 +32,7 @@ class BoundedUpdater(Updater):
         for name in ('app_password_verifier', 'app_https_hostname',
                      'app_ingress_core_peer', 'app_enrollment_approval'):
             require(cfg['options'].get(name) == '', 'Public password/route defaults must be empty')
+        preserve_historical_defaults(self, private_baseline_config_sha256)
 
     def run(self, mode, fingerprint, *, maintenance_confirmed=False,
             rollback_security_loss_confirmed=False, hook=lambda event, name: None):
@@ -45,10 +47,25 @@ class BoundedUpdater(Updater):
 
     def report(self, phase, fingerprint, recovery=False):
         result = super().report(phase, fingerprint, recovery)
-        result.update({'helper_version': '0.1.0', 'installed_target': 'local_dji_audio_archive',
+        result.update({'helper_version': '0.1.1', 'installed_target': 'local_dji_audio_archive',
                        'fresh_live_compatibility_only': True,
                        'maintenance_state_verified_by_helper': False,
                        'runtime_data_access': False})
+        # Effective config/bundle hashes remain private in local recovery only.
+        result.pop('config_sha256', None)
+        result.pop('baseline_config_sha256', None)
+        result['bundle_sha256'] = self.public_bundle_id
+        result['historical_defaults_preserved'] = self.customized
+        result['private_pin_verified'] = self.customized
+        return result
+
+    def mismatch_report(self, current):
+        result = super().mismatch_report(current)
+        for row in result['mismatches']:
+            for key in ('expected_baseline', 'expected_payload', 'observed'):
+                if row[key] is not None:
+                    row[key] = {'mode': row[key]['mode']}
+        result['hashes_redacted'] = True
         return result
 
 
@@ -58,7 +75,8 @@ def dispatch(options, root=ROOT, bundle=BUNDLE):
     require(mode in ('inspect', 'diagnose', 'apply', 'rollback'), 'Unsupported operation')
     for name in ('maintenance_confirmed', 'rollback_security_loss_confirmed'):
         require(type(options.get(name, False)) is bool, 'Confirmation flags must be booleans')
-    worker = BoundedUpdater(root, bundle, options.get('preserve_extra_files', []))
+    worker = BoundedUpdater(root, bundle, options.get('preserve_extra_files', []),
+                            options.get('private_baseline_config_sha256', ''))
     if mode == 'inspect':
         return worker.inspect()
     if mode == 'diagnose':
